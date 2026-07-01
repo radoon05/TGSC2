@@ -2,9 +2,9 @@ package sync
 
 import (
 	"context"
-	"time"
-
 	"tgsc/internal/logger"
+	"tgsc/internal/scraper"
+	"time"
 )
 
 // Scheduler runs periodic sync jobs based on a ticker.
@@ -16,18 +16,34 @@ type Scheduler struct {
 	running  bool
 }
 
-// NewScheduler creates a new scheduler.
-func NewScheduler(engine *Engine, interval time.Duration, log *logger.Logger) *Scheduler {
-	return &Scheduler{
-		engine:   engine,
-		interval: interval,
-		logger:   log,
-		stopChan: make(chan struct{}),
+// ScraperScheduler runs scraper + change detector periodically.
+type ScraperScheduler struct {
+	scraper        *scraper.Client
+	changeDetector *ChangeDetector
+	logger         *logger.Logger
+	interval       time.Duration
+	stopChan       chan struct{}
+	running        bool
+}
+
+// NewScraperScheduler creates a new scraper scheduler.
+func NewScraperScheduler(
+	scraper *scraper.Client,
+	changeDetector *ChangeDetector,
+	log *logger.Logger,
+	interval time.Duration,
+) *ScraperScheduler {
+	return &ScraperScheduler{
+		scraper:        scraper,
+		changeDetector: changeDetector,
+		logger:         log,
+		interval:       interval,
+		stopChan:       make(chan struct{}),
 	}
 }
 
-// Start begins the scheduler loop.
-func (s *Scheduler) Start(ctx context.Context) {
+// Start begins the scraper scheduler loop.
+func (s *ScraperScheduler) Start(ctx context.Context) {
 	if s.running {
 		return
 	}
@@ -35,8 +51,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 	go s.run(ctx)
 }
 
-// Stop gracefully stops the scheduler.
-func (s *Scheduler) Stop() {
+// Stop gracefully stops the scraper scheduler.
+func (s *ScraperScheduler) Stop() {
 	if !s.running {
 		return
 	}
@@ -44,24 +60,35 @@ func (s *Scheduler) Stop() {
 	s.running = false
 }
 
-func (s *Scheduler) run(ctx context.Context) {
+func (s *ScraperScheduler) run(ctx context.Context) {
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 
-	s.logger.Info("scheduler started", "interval", s.interval)
+	s.logger.Info("scraper scheduler started", "interval", s.interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Info("scheduler stopped due to context cancellation")
+			s.logger.Info("scraper scheduler stopped due to context cancellation")
 			return
 		case <-s.stopChan:
-			s.logger.Info("scheduler stopped by stop signal")
+			s.logger.Info("scraper scheduler stopped by stop signal")
 			return
 		case <-ticker.C:
-			s.logger.Debug("scheduler tick: triggering sync engine")
-			if err := s.engine.RunOnce(ctx); err != nil {
-				s.logger.Error("sync engine run failed", "error", err)
+			s.logger.Info("scraper scheduler tick: starting scrape")
+			products, err := s.scraper.FetchProducts(ctx)
+			if err != nil {
+				s.logger.Error("scrape failed", "error", err)
+				continue
+			}
+			s.logger.Info("scrape completed", "product_count", len(products))
+			if len(products) == 0 {
+				continue
+			}
+			if err := s.changeDetector.ProcessScrapedProducts(ctx, products); err != nil {
+				s.logger.Error("change detection failed", "error", err)
+			} else {
+				s.logger.Info("change detection completed")
 			}
 		}
 	}

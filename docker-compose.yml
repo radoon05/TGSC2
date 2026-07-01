@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tgsc-postgres-1
+    environment:
+      POSTGRES_USER: scraper
+      POSTGRES_PASSWORD: scraper123
+      POSTGRES_DB: scraper_sync
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: tgsc-app-1
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # ==================== دیتابیس ====================
+      DATABASE_URL: postgres://scraper:scraper123@postgres:5432/scraper_sync?sslmode=disable
+
+      # ==================== HTTP Server ====================
+      HTTP_PORT: 8080
+      LOG_LEVEL: info   
+
+      # ==================== Scraper (Eways) ====================
+      SCRAPER_BASE_URL: https://panel.eways.co/Store/ListLazy
+      SCRAPER_RATE_LIMIT: 2
+      SCRAPER_TIMEOUT: 30s
+      SCRAPER_RETRY_MAX: 3
+      SCRAPER_RETRY_BACKOFF: 3s
+      SCRAPER_PAGE_SIZE: 100
+
+      # ==================== اطلاعات لاگین Eways (اضافه شد) ====================
+      EWAYS_LOGIN_URL: https://panel.eways.co/User/Login
+      EWAYS_USERNAME: 09158673582
+      EWAYS_PASSWORD: Amirhosain@@202020
+
+      # ==================== WooCommerce ====================
+      WOO_BASE_URL: https://topguard.ir/wp-json/wc/v3
+      WOO_CONSUMER_KEY: ck_26647f8101f401b65d57a55ca1ecaa2224a8cacc
+      WOO_CONSUMER_SECRET: cs_7c33790d4bceab3f65f1cdd340c8b5d569e9ef9e
+      WOO_TIMEOUT: 30s
+      WOO_RATE_LIMIT: 10
+      WOO_BATCH_CREATE_SIZE: 10
+      WOO_BATCH_UPDATE_SIZE: 25
+
+      # ==================== Sync Engine (معماری دو-worker) ====================
+      SYNC_UPDATE_WORKER_COUNT: 10
+      SYNC_UPDATE_FETCH_LIMIT: 100
+      SYNC_UPDATE_BATCH_SIZE: 25
+
+      SYNC_CREATE_WORKER_COUNT: 2
+      SYNC_CREATE_FETCH_LIMIT: 20
+      SYNC_CREATE_BATCH_SIZE: 5
+
+      SYNC_RETRY_BACKOFF_BASE: 30s
+      SYNC_MAX_RETRIES: 3
+
+      # ==================== حالت تست (Dry Run) ====================
+      IS_DRY_RUN: true   # برای تست -> true، برای اجرای واقعی -> false
+
+      # ==================== تنظیمات اضافی قیمت‌گذاری ====================
+      FIXED_COST: 50000
+      ROUND_TO: 1000
+
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

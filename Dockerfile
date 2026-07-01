@@ -1,31 +1,24 @@
 # Stage 1: Build
-FROM golang:1.21-alpine AS builder
+FROM golang:1.26.1-alpine AS builder
+
+RUN apk add --no-cache chromium
 
 WORKDIR /app
 
-# Copy go.mod and go.sum first for better caching
-COPY go.mod go.sum ./
-RUN go mod download
-
-# Copy source code
+# کپی کل پروژه (شامل پوشه vendor)
 COPY . .
 
-# Build the binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o scraper-sync ./cmd/app
+# ساخت با استفاده از vendor (بدون نیاز به دانلود)
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -o tgsc ./cmd/app
 
 # Stage 2: Runtime
 FROM alpine:3.19
 
-RUN apk --no-cache add ca-certificates tzdata
+RUN apk add --no-cache chromium ca-certificates tzdata
 
 WORKDIR /root/
-
-# Copy binary and migrations
-COPY --from=builder /app/scraper-sync .
+COPY --from=builder /app/tgsc .
 COPY --from=builder /app/migrations ./migrations
 
-# Expose health check port
 EXPOSE 8080
-
-# Run the application
-CMD ["./scraper-sync"]
+CMD ["./tgsc"]

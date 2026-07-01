@@ -3,12 +3,12 @@ package integration
 import (
 	"context"
 	"testing"
-	"time"
+	// "time"
 
 	"tgsc/internal/domain"
-	"tgsc/internal/repository"
-	"tgsc/internal/sync"
-	"tgsc/internal/woo"
+	// "tgsc/internal/repository"
+	// "tgsc/internal/sync"
+	// "tgsc/internal/woo"
 	// In real integration, you would use testcontainers or a dedicated test DB
 )
 

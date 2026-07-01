@@ -12,17 +12,24 @@ import (
 	"tgsc/internal/woo"
 )
 
-// EngineConfig holds configuration for the sync engine.
+// EngineConfig holds configuration for the sync engine (separate for update and create)
 type EngineConfig struct {
-	WorkerCount      int           // number of concurrent workers
-	FetchLimit       int           // max jobs to fetch per RunOnce
-	RetryBackoffBase time.Duration // base delay for retry (exponential)
-	MaxRetries       int           // max retries before dead letter
-	BatchCreateSize  int           // max products per create batch
-	BatchUpdateSize  int           // max products per update batch
+	// Update workers
+	UpdateWorkerCount int
+	UpdateFetchLimit  int
+	UpdateBatchSize   int
+
+	// Create workers
+	CreateWorkerCount int
+	CreateFetchLimit  int
+	CreateBatchSize   int
+
+	// Shared
+	RetryBackoffBase time.Duration
+	MaxRetries       int
 }
 
-// Engine is the core sync engine that processes pending jobs.
+// Engine is the core sync engine with separate pools for update and create jobs.
 type Engine struct {
 	syncJobRepo repository.SyncJobRepository
 	productRepo repository.ProductRepository
@@ -30,7 +37,10 @@ type Engine struct {
 	logger      *logger.Logger
 	cfg         *EngineConfig
 
-	runMutex sync.Mutex // prevents concurrent RunOnce
+	updatePool *WorkerPool
+	createPool *WorkerPool
+
+	runMutex sync.Mutex
 }
 
 // NewEngine creates a new sync engine.
@@ -50,75 +60,85 @@ func NewEngine(
 	}
 }
 
-// RunOnce fetches pending jobs, builds batches, and processes them with a worker pool.
-// It is safe to call concurrently (only one execution at a time).
-func (e *Engine) RunOnce(ctx context.Context) error {
-	// Ensure only one RunOnce runs at a time
+// Start initializes and starts the worker pools.
+func (e *Engine) Start(ctx context.Context) {
+	e.updatePool = NewWorkerPool(e.cfg.UpdateWorkerCount, e.logger.Named("update-pool"))
+	e.createPool = NewWorkerPool(e.cfg.CreateWorkerCount, e.logger.Named("create-pool"))
+
+	e.updatePool.Start()
+	e.createPool.Start()
+
+	// Start the main loop that fetches jobs and submits to pools
+	go e.runLoop(ctx)
+}
+
+// Stop gracefully stops both worker pools.
+func (e *Engine) Stop() {
+	if e.updatePool != nil {
+		e.updatePool.Stop()
+	}
+	if e.createPool != nil {
+		e.createPool.Stop()
+	}
+}
+
+// runLoop continuously fetches pending jobs and submits them to appropriate pools.
+func (e *Engine) runLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second) // check every 30 seconds
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			e.logger.Info("engine run loop stopped")
+			return
+		case <-ticker.C:
+			e.processJobs(ctx)
+		}
+	}
+}
+
+// processJobs fetches pending jobs and submits to pools.
+func (e *Engine) processJobs(ctx context.Context) {
 	e.runMutex.Lock()
 	defer e.runMutex.Unlock()
 
-	// 1. Fetch pending jobs
-	jobs, err := e.syncJobRepo.FetchPendingJobs(ctx, e.cfg.FetchLimit)
+	// 1. Fetch create jobs
+	createJobs, err := e.syncJobRepo.FetchPendingJobsByType(ctx, "create", e.cfg.CreateFetchLimit)
 	if err != nil {
-		return fmt.Errorf("fetch pending jobs: %w", err)
+		e.logger.Error("failed to fetch create jobs", "error", err)
+	} else if len(createJobs) > 0 {
+		e.logger.Info("fetched create jobs", "count", len(createJobs))
+		e.submitBatches(ctx, createJobs, e.cfg.CreateBatchSize, e.createPool)
 	}
-	if len(jobs) == 0 {
-		e.logger.Debug("RunOnce: no pending jobs")
-		return nil
-	}
-	e.logger.Info("RunOnce: fetched pending jobs", "count", len(jobs))
 
-	// 2. Split jobs by type
-	createJobs := make([]*domain.SyncJob, 0, len(jobs))
-	updateJobs := make([]*domain.SyncJob, 0, len(jobs))
-	for _, job := range jobs {
-		if job.JobType == "create" {
-			createJobs = append(createJobs, job)
-		} else {
-			updateJobs = append(updateJobs, job)
+	// 2. Fetch update jobs
+	updateJobs, err := e.syncJobRepo.FetchPendingJobsByType(ctx, "update", e.cfg.UpdateFetchLimit)
+	if err != nil {
+		e.logger.Error("failed to fetch update jobs", "error", err)
+	} else if len(updateJobs) > 0 {
+		e.logger.Info("fetched update jobs", "count", len(updateJobs))
+		e.submitBatches(ctx, updateJobs, e.cfg.UpdateBatchSize, e.updatePool)
+	}
+}
+
+// submitBatches splits jobs into batches and submits to the given worker pool.
+func (e *Engine) submitBatches(ctx context.Context, jobs []*domain.SyncJob, batchSize int, pool *WorkerPool) {
+	batches := e.buildBatches(jobs, batchSize)
+	for _, b := range batches {
+		// Create a task from the batch
+		task := e.createBatchTask(ctx, b)
+		if !pool.Submit(task) {
+			e.logger.Warn("failed to submit batch to pool (pool stopped?)")
 		}
 	}
+}
 
-	// 3. Build batches
-	createBatches := e.buildBatches(createJobs, e.cfg.BatchCreateSize)
-	updateBatches := e.buildBatches(updateJobs, e.cfg.BatchUpdateSize)
-	totalBatches := len(createBatches) + len(updateBatches)
-	if totalBatches == 0 {
-		return nil
+// createBatchTask returns a Task function that processes a batch.
+func (e *Engine) createBatchTask(ctx context.Context, b *batch) Task {
+	return func(taskCtx context.Context) error {
+		return e.processBatch(ctx, b)
 	}
-
-	// 4. Create job channel and start workers
-	batchChan := make(chan *batch, totalBatches)
-	var wg sync.WaitGroup
-	for i := 0; i < e.cfg.WorkerCount; i++ {
-		wg.Add(1)
-		go e.worker(ctx, &wg, batchChan)
-	}
-
-	// 5. Send batches to workers
-	for _, b := range createBatches {
-		select {
-		case <-ctx.Done():
-			close(batchChan)
-			wg.Wait()
-			return ctx.Err()
-		case batchChan <- b:
-		}
-	}
-	for _, b := range updateBatches {
-		select {
-		case <-ctx.Done():
-			close(batchChan)
-			wg.Wait()
-			return ctx.Err()
-		case batchChan <- b:
-		}
-	}
-	close(batchChan)
-
-	// 6. Wait for all workers to finish
-	wg.Wait()
-	return nil
 }
 
 // buildBatches splits jobs into batches of max size.
@@ -137,36 +157,21 @@ func (e *Engine) buildBatches(jobs []*domain.SyncJob, batchSize int) []*batch {
 	return batches
 }
 
-// worker processes batches from the channel.
-func (e *Engine) worker(ctx context.Context, wg *sync.WaitGroup, batchChan <-chan *batch) {
-	defer wg.Done()
-	for b := range batchChan {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		e.processBatch(ctx, b)
-	}
-}
-
 // processBatch handles one batch of jobs (all same type: create or update).
-func (e *Engine) processBatch(ctx context.Context, b *batch) {
+func (e *Engine) processBatch(ctx context.Context, b *batch) error {
 	if len(b.jobs) == 0 {
-		return
+		return nil
 	}
-	jobType := b.jobs[0].JobType // "create" or "update"
+	jobType := b.jobs[0].JobType
 
 	// Step 1: load products and build sourceID -> job mapping
 	sourceIDToJob := make(map[string]*domain.SyncJob, len(b.jobs))
 	products := make([]*domain.Product, 0, len(b.jobs))
-	var loadErr error
 	for _, job := range b.jobs {
 		prod, err := e.productRepo.FindByID(ctx, job.ProductID)
 		if err != nil {
 			e.logger.Error("failed to load product for job", "job_id", job.ID, "error", err)
 			e.handleJobFailure(ctx, job, err)
-			loadErr = err
 			continue
 		}
 		if prod == nil {
@@ -179,10 +184,7 @@ func (e *Engine) processBatch(ctx context.Context, b *batch) {
 		products = append(products, prod)
 	}
 	if len(products) == 0 {
-		if loadErr != nil {
-			e.logger.Error("batch failed: no valid products loaded")
-		}
-		return
+		return nil
 	}
 
 	// Step 2: call WooCommerce batch API
@@ -194,25 +196,22 @@ func (e *Engine) processBatch(ctx context.Context, b *batch) {
 		result, apiErr = e.wooClient.BatchUpdateProducts(ctx, products)
 	}
 	if apiErr != nil {
-		// Complete batch failure (network, auth, etc.)
 		e.logger.Error("Woo batch API call failed", "job_type", jobType, "error", apiErr)
 		for _, job := range b.jobs {
 			e.handleJobFailure(ctx, job, apiErr)
 		}
-		return
+		return apiErr
 	}
 
 	// Step 3: process partial success/failure
 	for sourceID, job := range sourceIDToJob {
 		if result.SuccessSet[sourceID] {
-			// Success
 			if err := e.syncJobRepo.UpdateJobStatus(ctx, job.ID, domain.StateSuccess, "", job.RetryCount); err != nil {
 				e.logger.Error("failed to update job status to SUCCESS", "job_id", job.ID, "error", err)
 			} else {
 				e.logger.Debug("job succeeded", "job_id", job.ID, "type", job.JobType)
 			}
 		} else {
-			// Failure
 			errMsg := result.FailedIDs[sourceID]
 			if errMsg == "" {
 				errMsg = "unknown error in batch"
@@ -220,24 +219,22 @@ func (e *Engine) processBatch(ctx context.Context, b *batch) {
 			e.handleJobFailure(ctx, job, fmt.Errorf(errMsg))
 		}
 	}
+	return nil
 }
 
-// handleJobFailure decides whether to retry or move to dead letter.
 func (e *Engine) handleJobFailure(ctx context.Context, job *domain.SyncJob, err error) {
 	newRetryCount := job.RetryCount + 1
 	errMsg := err.Error()
 
 	if newRetryCount >= e.cfg.MaxRetries {
-		// Move to dead letter
-		if e := e.syncJobRepo.MarkAsDeadLetter(ctx, job.ID, errMsg); e != nil {
-			e.logger.Error("failed to mark job as dead letter", "job_id", job.ID, "error", e)
+		if markErr := e.syncJobRepo.MarkAsDeadLetter(ctx, job.ID, errMsg); markErr != nil {
+			e.logger.Error("failed to mark job as dead letter", "job_id", job.ID, "error", markErr)
 		} else {
 			e.logger.Warn("job moved to dead letter", "job_id", job.ID, "retries", job.RetryCount, "error", errMsg)
 		}
 		return
 	}
 
-	// Schedule retry with exponential backoff
 	nextDelay := job.NextRetryDelay(e.cfg.RetryBackoffBase)
 	nextScheduledAt := time.Now().Add(nextDelay)
 	if err := e.syncJobRepo.ScheduleRetry(ctx, job.ID, nextScheduledAt, errMsg); err != nil {

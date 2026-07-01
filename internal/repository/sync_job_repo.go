@@ -2,10 +2,8 @@ package repository
 
 import (
 	"context"
-	// "errors"
 	"time"
 
-	// "github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"tgsc/internal/domain"
@@ -15,6 +13,7 @@ import (
 type SyncJobRepository interface {
 	CreateJob(ctx context.Context, job *domain.SyncJob) error
 	FetchPendingJobs(ctx context.Context, limit int) ([]*domain.SyncJob, error)
+	FetchPendingJobsByType(ctx context.Context, jobType string, limit int) ([]*domain.SyncJob, error)
 	UpdateJobStatus(ctx context.Context, jobID string, state domain.SyncState, errMsg string, retryCount int) error
 	ScheduleRetry(ctx context.Context, jobID string, nextScheduledAt time.Time, errMsg string) error
 	MarkAsDeadLetter(ctx context.Context, jobID string, reason string) error
@@ -71,34 +70,78 @@ func (r *syncJobRepo) FetchPendingJobs(ctx context.Context, limit int) ([]*domai
 	return jobs, nil
 }
 
+func (r *syncJobRepo) FetchPendingJobsByType(ctx context.Context, jobType string, limit int) ([]*domain.SyncJob, error) {
+	query := `
+		SELECT id, product_id, job_type, state, retry_count, last_error, scheduled_at, started_at, finished_at, created_at, updated_at
+		FROM sync_jobs
+		WHERE state = $1 AND scheduled_at <= NOW() AND job_type = $2
+		ORDER BY scheduled_at ASC
+		LIMIT $3
+		FOR UPDATE SKIP LOCKED
+	`
+	rows, err := r.db.Query(ctx, query, domain.StatePending, jobType, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []*domain.SyncJob
+	for rows.Next() {
+		var j domain.SyncJob
+		err := rows.Scan(
+			&j.ID, &j.ProductID, &j.JobType, &j.State, &j.RetryCount, &j.LastError,
+			&j.ScheduledAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, &j)
+	}
+	return jobs, nil
+}
+
+// ✅ اصلاح شده: استفاده از $1::text برای جلوگیری از ابهام تایپ
 func (r *syncJobRepo) UpdateJobStatus(ctx context.Context, jobID string, state domain.SyncState, errMsg string, retryCount int) error {
+	stateStr := state.String()
 	query := `
 		UPDATE sync_jobs
-		SET state = $1, retry_count = $2, last_error = $3, updated_at = NOW(),
-			started_at = CASE WHEN $1 = 'RUNNING' AND started_at IS NULL THEN NOW() ELSE started_at END,
-			finished_at = CASE WHEN $1 IN ('SUCCESS', 'FAILED', 'DEAD_LETTER') THEN NOW() ELSE finished_at END
+		SET state = $1::text,
+		    retry_count = $2,
+		    last_error = $3,
+		    updated_at = NOW(),
+		    started_at = CASE WHEN $1::text = 'RUNNING' AND started_at IS NULL THEN NOW() ELSE started_at END,
+		    finished_at = CASE WHEN $1::text IN ('SUCCESS', 'FAILED', 'DEAD_LETTER') THEN NOW() ELSE finished_at END
 		WHERE id = $4
 	`
-	_, err := r.db.Exec(ctx, query, state, retryCount, errMsg, jobID)
+	_, err := r.db.Exec(ctx, query, stateStr, retryCount, errMsg, jobID)
 	return err
 }
 
+// ✅ اصلاح شده: استفاده از .String() و $1::text
 func (r *syncJobRepo) ScheduleRetry(ctx context.Context, jobID string, nextScheduledAt time.Time, errMsg string) error {
 	query := `
 		UPDATE sync_jobs
-		SET state = $1, scheduled_at = $2, last_error = $3, retry_count = retry_count + 1, updated_at = NOW()
+		SET state = $1::text,
+		    scheduled_at = $2,
+		    last_error = $3,
+		    retry_count = retry_count + 1,
+		    updated_at = NOW()
 		WHERE id = $4
 	`
-	_, err := r.db.Exec(ctx, query, domain.StatePending, nextScheduledAt, errMsg, jobID)
+	_, err := r.db.Exec(ctx, query, domain.StatePending.String(), nextScheduledAt, errMsg, jobID)
 	return err
 }
 
+// ✅ اصلاح شده: استفاده از .String() و $1::text
 func (r *syncJobRepo) MarkAsDeadLetter(ctx context.Context, jobID string, reason string) error {
 	query := `
 		UPDATE sync_jobs
-		SET state = $1, last_error = $2, finished_at = NOW(), updated_at = NOW()
+		SET state = $1::text,
+		    last_error = $2,
+		    finished_at = NOW(),
+		    updated_at = NOW()
 		WHERE id = $3
 	`
-	_, err := r.db.Exec(ctx, query, domain.StateDeadLetter, reason, jobID)
+	_, err := r.db.Exec(ctx, query, domain.StateDeadLetter.String(), reason, jobID)
 	return err
 }

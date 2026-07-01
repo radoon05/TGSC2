@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -22,10 +23,17 @@ type Client struct {
 	rateLimiter     *rate.Limiter
 	batchCreateSize int
 	batchUpdateSize int
+	dryRun          bool // اگر true باشد، درخواستی به Woo ارسال نمی‌شود
 }
 
 // NewClient creates a new WooCommerce client.
-func NewClient(baseURL, consumerKey, consumerSecret string, timeout time.Duration, rateLimit int, batchCreateSize, batchUpdateSize int) *Client {
+func NewClient(
+	baseURL, consumerKey, consumerSecret string,
+	timeout time.Duration,
+	rateLimit int,
+	batchCreateSize, batchUpdateSize int,
+	dryRun bool,
+) *Client {
 	return &Client{
 		baseURL:         baseURL,
 		consumerKey:     consumerKey,
@@ -36,6 +44,7 @@ func NewClient(baseURL, consumerKey, consumerSecret string, timeout time.Duratio
 		rateLimiter:     rate.NewLimiter(rate.Limit(rateLimit), 1),
 		batchCreateSize: batchCreateSize,
 		batchUpdateSize: batchUpdateSize,
+		dryRun:          dryRun,
 	}
 }
 
@@ -60,6 +69,19 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body []byte
 
 // BatchCreateProducts creates multiple products in a single request.
 func (c *Client) BatchCreateProducts(ctx context.Context, products []*domain.Product) (*BatchResult, error) {
+	if c.dryRun {
+		log.Printf("🔹 DRY RUN: درخواست BatchCreate به WooCommerce ارسال نشد (تعداد محصولات: %d)", len(products))
+		// برگرداندن پاسخ ساختگی (همه موفق)
+		result := &BatchResult{
+			SuccessSet: make(map[string]bool),
+			FailedIDs:  make(map[string]string),
+		}
+		for _, p := range products {
+			result.SuccessSet[p.SourceID] = true
+		}
+		return result, nil
+	}
+
 	wooProducts := make([]*WooProduct, len(products))
 	for i, p := range products {
 		wooProducts[i] = MapDomainToWoo(p)
@@ -70,6 +92,18 @@ func (c *Client) BatchCreateProducts(ctx context.Context, products []*domain.Pro
 
 // BatchUpdateProducts updates multiple products in a single request.
 func (c *Client) BatchUpdateProducts(ctx context.Context, products []*domain.Product) (*BatchResult, error) {
+	if c.dryRun {
+		log.Printf("🔹 DRY RUN: درخواست BatchUpdate به WooCommerce ارسال نشد (تعداد محصولات: %d)", len(products))
+		result := &BatchResult{
+			SuccessSet: make(map[string]bool),
+			FailedIDs:  make(map[string]string),
+		}
+		for _, p := range products {
+			result.SuccessSet[p.SourceID] = true
+		}
+		return result, nil
+	}
+
 	wooProducts := make([]*WooProduct, len(products))
 	for i, p := range products {
 		wooProducts[i] = MapDomainToWoo(p)
