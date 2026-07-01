@@ -23,7 +23,9 @@ type Client struct {
 	rateLimiter     *rate.Limiter
 	batchCreateSize int
 	batchUpdateSize int
-	dryRun          bool // اگر true باشد، درخواستی به Woo ارسال نمی‌شود
+	dryRun          bool
+	fixedCost       float64 // 🔥 اضافه شد
+	roundTo         float64 // 🔥 اضافه شد
 }
 
 // NewClient creates a new WooCommerce client.
@@ -33,6 +35,8 @@ func NewClient(
 	rateLimit int,
 	batchCreateSize, batchUpdateSize int,
 	dryRun bool,
+	fixedCost float64, // 🔥 پارامتر جدید
+	roundTo float64,   // 🔥 پارامتر جدید
 ) *Client {
 	return &Client{
 		baseURL:         baseURL,
@@ -45,6 +49,8 @@ func NewClient(
 		batchCreateSize: batchCreateSize,
 		batchUpdateSize: batchUpdateSize,
 		dryRun:          dryRun,
+		fixedCost:       fixedCost, // 🔥 مقداردهی
+		roundTo:         roundTo,   // 🔥 مقداردهی
 	}
 }
 
@@ -84,7 +90,8 @@ func (c *Client) BatchCreateProducts(ctx context.Context, products []*domain.Pro
 
 	wooProducts := make([]*WooProduct, len(products))
 	for i, p := range products {
-		wooProducts[i] = MapDomainToWoo(p)
+		// 🔥 استفاده از fixedCost و roundTo از struct
+		wooProducts[i] = MapDomainToWoo(p, c.fixedCost, c.roundTo)
 	}
 	payload := BatchCreatePayload{Create: wooProducts}
 	return c.doBatchRequest(ctx, "POST", "/products/batch", payload)
@@ -106,7 +113,8 @@ func (c *Client) BatchUpdateProducts(ctx context.Context, products []*domain.Pro
 
 	wooProducts := make([]*WooProduct, len(products))
 	for i, p := range products {
-		wooProducts[i] = MapDomainToWoo(p)
+		// 🔥 استفاده از fixedCost و roundTo از struct
+		wooProducts[i] = MapDomainToWoo(p, c.fixedCost, c.roundTo)
 	}
 	payload := BatchUpdatePayload{Update: wooProducts}
 	return c.doBatchRequest(ctx, "POST", "/products/batch", payload)

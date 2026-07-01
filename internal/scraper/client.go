@@ -214,15 +214,22 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 		return nil, false, fmt.Errorf("json decode: %w", err)
 	}
 
-	// داخل تابع fetchPage، بعد از Unmarshal:
-	if len(ewaysResp.Goods) == 0 {
-		return nil, false, nil
-	}
-
+	// داخل fetchPage، بعد از Unmarshal:
 	products := make([]*domain.Product, 0, len(ewaysResp.Goods))
 	for _, g := range ewaysResp.Goods {
-		// فقط محصولات موجود را ذخیره کنیم (اختیاری)
-		// if !g.Availability { continue }
+		// پیدا کردن اطلاعات دسته‌بندی
+		var wpCatID int
+		var priceCoeff float64
+		for _, cat := range c.categories {
+			if cat.EwaysCatID == catID {
+				wpCatID = cat.WPCatID
+				priceCoeff = cat.PriceCoeff
+				break
+			}
+		}
+		if priceCoeff == 0 {
+			priceCoeff = 1.0
+		}
 
 		products = append(products, &domain.Product{
 			SourceID:      strconv.Itoa(g.ID),
@@ -230,6 +237,10 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 			Price:         g.Price,
 			Stock:         g.Stock,
 			LastScrapedAt: time.Now(),
+			WPCatID:       wpCatID,
+			PriceCoeff:    priceCoeff,
+			ImageURL:      g.ImageURL,
+			EwaysCatID:    catID,
 		})
 	}
 	return products, true, nil

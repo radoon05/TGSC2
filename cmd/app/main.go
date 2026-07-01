@@ -77,7 +77,9 @@ func main() {
 		cfg.Woo.RateLimit,
 		cfg.Woo.BatchCreateSize,
 		cfg.Woo.BatchUpdateSize,
-		cfg.App.IsDryRun, // اضافه کردن این پارامتر
+		cfg.App.IsDryRun,
+		cfg.App.FixedCost, // 🔥 اضافه شد
+		cfg.App.RoundTo,   // 🔥 اضافه شد
 	)
 
 	// Create normalizer and change detector
@@ -262,7 +264,7 @@ func main() {
 		log.Info("test scrape triggered - running in background")
 
 		testCategories := []config.Category{
-			{Name: "قاب و کاور اپل", EwaysCatID: "19136", WPCatID: 365, PriceCoeff: 1.10},
+			{Name: "test cat", EwaysCatID: "21285", WPCatID: 38, PriceCoeff: 1.2},
 		}
 		testScraper := scraper.NewClient(
 			&cfg.Scraper,

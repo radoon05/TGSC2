@@ -63,3 +63,21 @@ func (n *Normalizer) GenerateFingerprint(p *domain.Product) string {
 func (n *Normalizer) SetStockBuffer(buffer int) {
 	n.stockBuffer = buffer
 }
+
+// CalculateFinalPrice قیمت نهایی را از ریال به تومان تبدیل، ضریب و سود ثابت اعمال کرده و گرد می‌کند
+func (n *Normalizer) CalculateFinalPrice(priceRial float64, coeff float64, fixedCost float64, roundTo float64) float64 {
+    // 1. تبدیل ریال به تومان (هر ۱۰ ریال = ۱ تومان)
+    priceToman := priceRial / 10.0
+    
+    // 2. اعمال ضریب دسته‌بندی
+    priceWithCoeff := priceToman * coeff
+    
+    // 3. اضافه کردن هزینه ثابت
+    priceWithFixed := priceWithCoeff + fixedCost
+    
+    // 4. گرد کردن به مضرب roundTo (مثلاً ۱۰۰۰ تومان)
+    if roundTo > 0 {
+        return float64(int(priceWithFixed/roundTo+0.5)) * roundTo
+    }
+    return priceWithFixed
+}

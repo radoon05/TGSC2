@@ -1,111 +1,87 @@
 package scraper
 
 import (
-	"fmt"
+	"context"
 	"net/http"
-	"net/http/cookiejar"
-	"net/url"
-	"strings"
 	"time"
+
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 )
 
-// GetEwaysCookies با استفاده از HTTP Client ساده لاگین کرده و کوکی کامل (شامل Aut) را برمی‌گرداند
+// GetEwaysCookies با استفاده از chromedp (headless=false) لاگین کرده و کوکی کامل را برمی‌گرداند
 func GetEwaysCookies(username, password, loginURL string) ([]*http.Cookie, error) {
-	// ایجاد CookieJar
-	jar, _ := cookiejar.New(nil)
+	// تنظیمات chromedp با headless=false (مرورگر قابل مشاهده)
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", false), // 🔴 مرورگر با GUI باز می‌شود
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-translate", true),
+		chromedp.Flag("disable-notifications", true),
+		chromedp.Flag("disable-infobars", true),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.Flag("window-size", "1200,800"),
+	)
 
-	// ساخت داده‌های فرم
-	data := url.Values{}
-	data.Set("username", username)
-	data.Set("password", password)
+	// ایجاد context مرورگر
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
 
-	// ساخت درخواست
-	req, err := http.NewRequest("POST", loginURL, strings.NewReader(data.Encode()))
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
+	var networkCookies []*network.Cookie
+
+	err := chromedp.Run(ctx,
+		// ۱. رفتن به صفحه لاگین
+		chromedp.Navigate(loginURL),
+
+		// ۲. منتظر ماندن برای ظاهر شدن فرم
+		chromedp.WaitVisible(`#UserName`, chromedp.ByID),
+		chromedp.Sleep(1*time.Second),
+
+		// ۳. پر کردن فرم
+		chromedp.SetValue(`#UserName`, username, chromedp.ByID),
+		chromedp.SetValue(`#Password`, password, chromedp.ByID),
+		chromedp.Sleep(500*time.Millisecond),
+
+		// ۴. کلیک روی دکمه لاگین
+		chromedp.EvaluateAsDevTools(`document.getElementById('btnSubmit').click();`, nil),
+
+		// ۵. منتظر ماندن برای ریدایرکت و بارگذاری صفحه اصلی
+		chromedp.Sleep(5*time.Second),
+		chromedp.WaitReady(`body`, chromedp.ByQuery),
+		chromedp.Sleep(2*time.Second),
+
+		// ۶. دریافت کوکی‌ها
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var err error
+			networkCookies, err = network.GetCookies().Do(ctx)
+			return err
+		}),
+	)
+
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9,fa;q=0.8")
-	req.Header.Set("Referer", "https://panel.eways.co/User/Login")
 
-	// ✅ کلاینت بدون دنبال کردن ریدایرکت
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse // جلوگیری از دنبال کردن ریدایرکت
-		},
+	// تبدیل []*network.Cookie به []*http.Cookie
+	httpCookies := make([]*http.Cookie, 0, len(networkCookies))
+	for _, c := range networkCookies {
+		httpCookies = append(httpCookies, &http.Cookie{
+			Name:     c.Name,
+			Value:    c.Value,
+			Domain:   c.Domain,
+			Path:     c.Path,
+			Secure:   c.Secure,
+			HttpOnly: c.HTTPOnly,
+			Expires:  time.Unix(int64(c.Expires), 0),
+		})
 	}
 
-	// اجرای درخواست
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// بررسی وضعیت (باید 302 باشد)
-	if resp.StatusCode != http.StatusFound && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("login failed with status: %d", resp.StatusCode)
-	}
-
-	// 🔑 استخراج کوکی Aut از هدر Set-Cookie
-	var autCookie *http.Cookie
-	for _, cookie := range resp.Header["Set-Cookie"] {
-		// تجزیه کوکی
-		parts := strings.Split(cookie, ";")
-		nameValue := strings.TrimSpace(parts[0])
-		nameValueParts := strings.SplitN(nameValue, "=", 2)
-		if len(nameValueParts) != 2 {
-			continue
-		}
-		name := nameValueParts[0]
-		value := nameValueParts[1]
-
-		if name == "Aut" {
-			autCookie = &http.Cookie{
-				Name:     name,
-				Value:    value,
-				Domain:   "panel.eways.co",
-				Path:     "/",
-				Secure:   true,
-				HttpOnly: true,
-				Expires:  time.Now().Add(24 * time.Hour), // تخمین زمان انقضا
-			}
-			break
-		}
-	}
-
-	if autCookie == nil {
-		return nil, fmt.Errorf("Aut cookie not found in login response")
-	}
-
-	// اضافه کردن کوکی Aut به Jar
-	u, _ := url.Parse("https://panel.eways.co")
-	jar.SetCookies(u, []*http.Cookie{autCookie})
-
-	// همچنین کوکی config را هم از پاسخ بگیریم (اگر وجود داشت)
-	for _, cookie := range resp.Header["Set-Cookie"] {
-		parts := strings.Split(cookie, ";")
-		nameValue := strings.TrimSpace(parts[0])
-		nameValueParts := strings.SplitN(nameValue, "=", 2)
-		if len(nameValueParts) != 2 {
-			continue
-		}
-		name := nameValueParts[0]
-		value := nameValueParts[1]
-
-		if name == "config" {
-			jar.SetCookies(u, []*http.Cookie{{
-				Name:   name,
-				Value:  value,
-				Domain: "panel.eways.co",
-				Path:   "/",
-			}})
-			break
-		}
-	}
-
-	return jar.Cookies(u), nil
+	return httpCookies, nil
 }
