@@ -16,9 +16,14 @@ type Product struct {
 	CreatedAt     time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at" db:"updated_at"`
 
-	// 🔥 فیلدهای جدید برای ووکامرس (اکنون در دیتابیس ذخیره می‌شوند)
+	// فیلدهای ووکامرس
 	WPCatID    int     `json:"wp_cat_id" db:"wp_cat_id"`
 	PriceCoeff float64 `json:"price_coeff" db:"price_coeff"`
 	ImageURL   string  `json:"image_url" db:"image_url"`
-	EwaysCatID string  `json:"eways_cat_id" db:"eways_cat_id"` // برای رفع اشکال
+	EwaysCatID string  `json:"eways_cat_id" db:"eways_cat_id"`
+
+	// 🔥 فیلدهای جدید برای جزئیات کامل محصول
+	FullDescription string   `json:"full_description" db:"full_description"`
+	Attributes      string   `json:"attributes" db:"attributes"`          // JSON string
+	GalleryImages   []string `json:"gallery_images" db:"gallery_images"`   // JSON array in DB
 }

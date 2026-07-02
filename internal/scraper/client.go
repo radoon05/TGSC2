@@ -10,18 +10,23 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/time/rate"
 
 	"tgsc/internal/config"
 	"tgsc/internal/domain"
 )
 
-// Client handles scraping products from Eways with POST requests and pagination.
+// ================================================================
+//  Client
+// ================================================================
+
 type Client struct {
 	httpClient   *http.Client
 	baseURL      string
@@ -31,20 +36,18 @@ type Client struct {
 	rateLimiter  *rate.Limiter
 	retryMax     int
 	retryBackoff time.Duration
-	pageSize     int // تعداد محصول در هر صفحه (۲۴ در کد اصلی)
+	pageSize     int
 	categories   []config.Category
 	loggedIn     bool
 	mu           sync.Mutex
 }
 
 // NewClient creates a new scraper client with authentication and category support.
-
 func NewClient(
 	cfg *config.ScraperConfig,
 	loginURL, username, password string,
 	categories []config.Category,
 ) *Client {
-	// دریافت کوکی با go-rod
 	cookies, err := GetEwaysCookies(username, password, loginURL)
 	if err != nil {
 		log.Fatalf("❌ خطا در دریافت کوکی: %v", err)
@@ -72,7 +75,10 @@ func NewClient(
 	}
 }
 
-// login authenticates with Eways and stores session cookies.
+// ================================================================
+//  لاگین
+// ================================================================
+
 func (c *Client) login(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -98,7 +104,6 @@ func (c *Client) login(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	// لاگین موفق با 302 یا 200
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusFound {
 		return fmt.Errorf("login failed: %s", resp.Status)
 	}
@@ -106,22 +111,27 @@ func (c *Client) login(ctx context.Context) error {
 	return nil
 }
 
-// FetchProducts scrapes all products from all categories and returns domain products.
+// Login public method
+func (c *Client) Login(ctx context.Context) error {
+	return c.login(ctx)
+}
+
+// ================================================================
+//  دریافت محصولات (اسکرپ اصلی)
+// ================================================================
+
 func (c *Client) FetchProducts(ctx context.Context) ([]*domain.Product, error) {
 	if err := c.login(ctx); err != nil {
 		return nil, fmt.Errorf("authentication failed: %w", err)
 	}
 
 	var allProducts []*domain.Product
-
 	for _, cat := range c.categories {
 		if cat.EwaysCatID == "" {
 			continue
 		}
 		products, err := c.fetchCategoryProducts(ctx, cat.EwaysCatID)
 		if err != nil {
-			// لاگ خطا ولی ادامه بده
-			// می‌توانیم با logger لاگ کنیم، فعلاً ignore می‌کنیم
 			continue
 		}
 		allProducts = append(allProducts, products...)
@@ -129,14 +139,11 @@ func (c *Client) FetchProducts(ctx context.Context) ([]*domain.Product, error) {
 	return allProducts, nil
 }
 
-// fetchCategoryProducts scrapes products for a single category with pagination.
 func (c *Client) fetchCategoryProducts(ctx context.Context, catID string) ([]*domain.Product, error) {
 	var allProducts []*domain.Product
 
-	// صفحه‌بندی: MainPage و LazyPage (مثل کد اصلی)
 	for mainPage := 0; mainPage <= 60; mainPage++ {
 		foundOnThisMainPage := false
-
 		for lazyPart := 0; lazyPart <= 5; lazyPart++ {
 			select {
 			case <-ctx.Done():
@@ -144,7 +151,6 @@ func (c *Client) fetchCategoryProducts(ctx context.Context, catID string) ([]*do
 			default:
 			}
 
-			// ساخت payload مثل کد اصلی
 			payload := fmt.Sprintf(
 				"ListViewType=0&CatId=%s&Order=2&Sort=2&LazyPageIndex=%d&PageIndex=%d&PageSize=24&Available=1&IsLazyLoading=true",
 				catID, lazyPart, mainPage,
@@ -152,20 +158,16 @@ func (c *Client) fetchCategoryProducts(ctx context.Context, catID string) ([]*do
 
 			products, found, err := c.fetchPage(ctx, catID, payload)
 			if err != nil {
-				// اگر خطا داشت، لاگ کن و ادامه بده
 				continue
 			}
 			if found {
 				foundOnThisMainPage = true
 				allProducts = append(allProducts, products...)
 			} else {
-				// اگر هیچ محصولی در این lazy part نبود، از حلقه lazy خارج شو
 				break
 			}
-			// تأخیر بین درخواست‌ها مثل کد اصلی
 			time.Sleep(200 * time.Millisecond)
 		}
-		// اگر در این mainPage هیچ محصولی پیدا نشد، صفحه‌بندی تمام شده
 		if !foundOnThisMainPage {
 			break
 		}
@@ -186,13 +188,6 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 
-	// // لاگ کوکی‌ها
-	// cookies := c.httpClient.Jar.Cookies(req.URL)
-	// log.Printf("🔍 تعداد کوکی‌ها: %d", len(cookies))
-	// for _, ck := range cookies {
-	// 	log.Printf("   🍪 %s = %s...", ck.Name, ck.Value[:20])
-	// }
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, false, err
@@ -208,29 +203,31 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 		return nil, false, err
 	}
 
-	// Parse response
 	var ewaysResp EwaysResponse
 	if err := json.Unmarshal(bodyBytes, &ewaysResp); err != nil {
 		return nil, false, fmt.Errorf("json decode: %w", err)
 	}
 
-	// داخل fetchPage، بعد از Unmarshal:
+	if len(ewaysResp.Goods) == 0 {
+		return nil, false, nil
+	}
+
+	// پیدا کردن اطلاعات دسته‌بندی
+	var wpCatID int
+	var priceCoeff float64
+	for _, cat := range c.categories {
+		if cat.EwaysCatID == catID {
+			wpCatID = cat.WPCatID
+			priceCoeff = cat.PriceCoeff
+			break
+		}
+	}
+	if priceCoeff == 0 {
+		priceCoeff = 1.0
+	}
+
 	products := make([]*domain.Product, 0, len(ewaysResp.Goods))
 	for _, g := range ewaysResp.Goods {
-		// پیدا کردن اطلاعات دسته‌بندی
-		var wpCatID int
-		var priceCoeff float64
-		for _, cat := range c.categories {
-			if cat.EwaysCatID == catID {
-				wpCatID = cat.WPCatID
-				priceCoeff = cat.PriceCoeff
-				break
-			}
-		}
-		if priceCoeff == 0 {
-			priceCoeff = 1.0
-		}
-
 		products = append(products, &domain.Product{
 			SourceID:      strconv.Itoa(g.ID),
 			Title:         g.Name,
@@ -244,13 +241,129 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 		})
 	}
 	return products, true, nil
-
 }
 
-// Login را عمومی می‌کنیم تا از بیرون قابل دسترسی باشد
-func (c *Client) Login(ctx context.Context) error {
-	return c.login(ctx)
+// ================================================================
+//  دریافت جزئیات کامل محصول (صفحه محصول)
+// ================================================================
+
+// EwaysProductDetail ساختار جزئیات کامل محصول از صفحه HTML
+type EwaysProductDetail struct {
+	ID          int      `json:"Id"`
+	Name        string   `json:"Name"`
+	Description string   `json:"Description"`
+	Images      []string `json:"Images"`
+	Attributes  []struct {
+		Name  string `json:"Name"`
+		Value string `json:"Value"`
+	} `json:"Attributes"`
 }
+
+// GetProductDetailFromPage با رفتن به صفحه محصول، اطلاعات را از HTML استخراج می‌کند
+func (c *Client) GetProductDetailFromPage(ctx context.Context, productID string, categoryID string) (*EwaysProductDetail, error) {
+	if err := c.rateLimiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	// 🔥 آدرس صحیح محصول در ایویز
+	url := fmt.Sprintf("https://panel.eways.co/Store/Detail/%s/%s", categoryID, productID)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status: %s", resp.Status)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	detail := &EwaysProductDetail{
+		ID:     parseInt(productID),
+		Images: []string{},
+		Attributes: []struct {
+			Name  string `json:"Name"`
+			Value string `json:"Value"`
+		}{},
+	}
+
+	// ============================================================
+	// ۱. توضیحات محصول (اگر وجود داشته باشد)
+	// ============================================================
+	// فعلاً خالی می‌گذاریم – می‌توانید selector واقعی را جایگزین کنید
+	// مثال: doc.Find(".product-description").Text()
+	detail.Description = ""
+
+	// ============================================================
+	// ۲. گالری تصاویر – استخراج از ویژگی onclick
+	// ============================================================
+	// ابتدا از تصویر اصلی (goods-image) تلاش می‌کنیم
+	imgSelection := doc.Find(".goods-image img[onclick]")
+	if imgSelection.Length() > 0 {
+		onclick, exists := imgSelection.Attr("onclick")
+		if exists {
+			// استخراج آرایه تصاویر با regex
+			re := regexp.MustCompile(`ShowPhotoGalleryDialog\(\[(.*?)\],`)
+			matches := re.FindStringSubmatch(onclick)
+			if len(matches) > 1 {
+				// matches[1] شامل لیست URLها به صورت "url1","url2",...
+				parts := strings.Split(matches[1], ",")
+				for _, p := range parts {
+					p = strings.Trim(p, "\" ")
+					if p != "" {
+						detail.Images = append(detail.Images, p)
+					}
+				}
+			}
+		}
+	}
+
+	// اگر تصویری پیدا نشد، از تام‌نیل‌ها استفاده کن
+	if len(detail.Images) == 0 {
+		doc.Find(".goods-thumb .thumbnail img").Each(func(i int, s *goquery.Selection) {
+			if src, exists := s.Attr("src"); exists {
+				detail.Images = append(detail.Images, src)
+			}
+		})
+	}
+
+	// ============================================================
+	// ۳. ویژگی‌ها (مشخصات فنی) – از جدول
+	// ============================================================
+	doc.Find("#link1 .table tbody tr").Each(func(i int, s *goquery.Selection) {
+		name := strings.TrimSpace(s.Find("td.text-nowrap.bold").Text())
+		value := strings.TrimSpace(s.Find("td").Not(".text-nowrap.bold").Text())
+		if name != "" && value != "" {
+			detail.Attributes = append(detail.Attributes, struct {
+				Name  string `json:"Name"`
+				Value string `json:"Value"`
+			}{Name: name, Value: value})
+		}
+	})
+
+	return detail, nil
+}
+
+// helper: تبدیل string به int
+func parseInt(s string) int {
+	i, _ := strconv.Atoi(s)
+	return i
+}
+
+// ================================================================
+//  متدهای کمکی
+// ================================================================
 
 // FetchRaw یک درخواست POST با payload مشخص ارسال می‌کند و body خام را برمی‌گرداند
 func (c *Client) FetchRaw(ctx context.Context, payload string) ([]byte, error) {
@@ -272,18 +385,20 @@ func (c *Client) FetchRaw(ctx context.Context, payload string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// EwaysResponse ساختار پاسخ دریافتی از API ایویز
+// ================================================================
+//  ساختارهای پاسخ ایویز
+// ================================================================
+
 type EwaysResponse struct {
 	Goods []EwaysProduct `json:"Goods"`
 }
 
-// EwaysProduct ساختار دقیق یک محصول بر اساس کالبدشکافی JSON
 type EwaysProduct struct {
-	ID           int     `json:"Id"`           // شناسه محصول
-	Name         string  `json:"Name"`         // عنوان محصول
-	Price        float64 `json:"Price"`        // قیمت
-	OldPrice     float64 `json:"OldPrice"`     // قیمت خط خورده (اختیاری)
-	Stock        int     `json:"Stock"`        // موجودی
-	Availability bool    `json:"Availability"` // وضعیت موجودی (true/false)
-	ImageURL     string  `json:"ImageUrl"`     // آدرس تصویر
+	ID           int     `json:"Id"`
+	Name         string  `json:"Name"`
+	Price        float64 `json:"Price"`
+	OldPrice     float64 `json:"OldPrice"`
+	Stock        int     `json:"Stock"`
+	Availability bool    `json:"Availability"`
+	ImageURL     string  `json:"ImageUrl"`
 }

@@ -58,14 +58,13 @@ func main() {
 	syncJobRepo := repository.NewSyncJobRepository(dbPool)
 
 	// Create scraper with login credentials
-	// در بخش ساخت scraperClient:
 	categories := config.GetCategories()
 	scraperClient := scraper.NewClient(
 		&cfg.Scraper,
 		cfg.Eways.LoginURL,
 		cfg.Eways.Username,
 		cfg.Eways.Password,
-		categories, // ← این را اضافه کنید
+		categories,
 	)
 
 	// Create Woo client
@@ -78,8 +77,8 @@ func main() {
 		cfg.Woo.BatchCreateSize,
 		cfg.Woo.BatchUpdateSize,
 		cfg.App.IsDryRun,
-		cfg.App.FixedCost, // 🔥 اضافه شد
-		cfg.App.RoundTo,   // 🔥 اضافه شد
+		cfg.App.FixedCost,
+		cfg.App.RoundTo,
 	)
 
 	// Create normalizer and change detector
@@ -103,7 +102,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	engine.Start(ctx)
 
-	// Create schedulers for scraping
+	// ============================================================
+	// 🔥 Schedulerها با ارسال scraperClient برای دریافت جزئیات
+	// ============================================================
+
 	// Scheduler 1: Update (every 2 hours)
 	updateScraperScheduler := sync.NewScraperScheduler(
 		scraperClient,
@@ -118,12 +120,16 @@ func main() {
 		scraperClient,
 		changeDetector,
 		log.Named("create-scraper"),
-		12*time.Hour,
+		4*time.Hour,
 	)
 	createScraperScheduler.Start(ctx)
 
-	// Setup health endpoint
+	// ============================================================
+	//  HTTP Handlers
+	// ============================================================
+
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -136,17 +142,16 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status": "ok"}`)
 	})
-	// Add metrics endpoint
+
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
-		// Placeholder - will be implemented with prometheus later
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "# Metrics endpoint\n")
 	})
+
 	mux.HandleFunc("POST /debug-raw", func(w http.ResponseWriter, r *http.Request) {
 		log := logger.New(cfg.LogLevel).Named("debug")
 		log.Info("debug raw response triggered")
 
-		// فقط یک دسته برای تست
 		testCategories := []config.Category{
 			{Name: "قاب و کاور اپل", EwaysCatID: "19136", WPCatID: 365, PriceCoeff: 1.10},
 		}
@@ -159,7 +164,6 @@ func main() {
 		)
 
 		ctx := r.Context()
-		// لاگین اولیه
 		if err := testScraper.Login(ctx); err != nil {
 			log.Error("login failed", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -167,7 +171,6 @@ func main() {
 			return
 		}
 
-		// ارسال یک درخواست نمونه و چاپ پاسخ خام
 		payload := fmt.Sprintf(
 			"ListViewType=0&CatId=%s&Order=2&Sort=2&LazyPageIndex=0&PageIndex=0&PageSize=24&Available=1&IsLazyLoading=true",
 			"19136",
@@ -196,7 +199,8 @@ func main() {
 			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
 			return
 		}
-		if err := changeDetector.ProcessScrapedProducts(r.Context(), products); err != nil {
+		// 🔥 ارسال scraperClient برای دریافت جزئیات
+		if err := changeDetector.ProcessScrapedProducts(r.Context(), products, scraperClient); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
 			return
@@ -210,12 +214,11 @@ func main() {
 		log := logger.New(cfg.LogLevel).Named("export")
 		log.Info("export products requested")
 
-		// کوئری برای دریافت محصولات با قیمت و موجودی
 		rows, err := dbPool.Query(r.Context(), `
-        SELECT source_id, title, price, stock, fingerprint, last_scraped_at 
-        FROM products 
-        ORDER BY created_at DESC
-    `)
+			SELECT source_id, title, price, stock, fingerprint, last_scraped_at 
+			FROM products 
+			ORDER BY created_at DESC
+		`)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, "خطا در خواندن دیتابیس: %v", err)
@@ -223,11 +226,9 @@ func main() {
 		}
 		defer rows.Close()
 
-		// تنظیم هدر برای دانلود فایل TXT
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Disposition", "attachment; filename=products_export.txt")
 
-		// نوشتن هدر فایل
 		fmt.Fprintf(w, "=== گزارش محصولات تاپ گارد ===\n")
 		fmt.Fprintf(w, "تاریخ: %s\n", time.Now().Format("2006-01-02 15:04:05"))
 		fmt.Fprintf(w, "================================\n\n")
@@ -245,7 +246,6 @@ func main() {
 				continue
 			}
 			count++
-			// برش عنوان در صورت طولانی بودن
 			displayTitle := title
 			if len(displayTitle) > 50 {
 				displayTitle = displayTitle[:50] + "..."
@@ -264,7 +264,7 @@ func main() {
 		log.Info("test scrape triggered - running in background")
 
 		testCategories := []config.Category{
-			{Name: "test cat", EwaysCatID: "21285", WPCatID: 38, PriceCoeff: 1.2},
+			{Name: "test cat", EwaysCatID: "18482", WPCatID: 38, PriceCoeff: 1.2},
 		}
 		testScraper := scraper.NewClient(
 			&cfg.Scraper,
@@ -285,7 +285,8 @@ func main() {
 			if len(products) == 0 {
 				return
 			}
-			if err := changeDetector.ProcessScrapedProducts(ctx, products); err != nil {
+			// 🔥 ارسال scraperClient برای دریافت جزئیات
+			if err := changeDetector.ProcessScrapedProducts(ctx, products, testScraper); err != nil {
 				log.Error("test change detection failed", "error", err)
 			} else {
 				log.Info("test change detection completed")
@@ -299,6 +300,10 @@ func main() {
 			"message": "test scrape started in background, check logs for results",
 		})
 	})
+
+	// ============================================================
+	//  HTTP Server
+	// ============================================================
 
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.HTTPPort,
@@ -316,13 +321,15 @@ func main() {
 		}
 	}()
 
-	// Wait for interrupt signal
+	// ============================================================
+	//  Graceful Shutdown
+	// ============================================================
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info("shutting down gracefully...")
 
-	// Graceful shutdown
 	cancel()
 	engine.Stop()
 	updateScraperScheduler.Stop()
@@ -344,7 +351,6 @@ func runMigrations(databaseURL string) error {
 	}
 	defer db.Close()
 
-	// بررسی وجود جدول products
 	var exists bool
 	err = db.QueryRow("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'products')").Scan(&exists)
 	if err != nil {

@@ -85,7 +85,7 @@ func (s *ScraperScheduler) run(ctx context.Context) {
 			if len(products) == 0 {
 				continue
 			}
-			if err := s.changeDetector.ProcessScrapedProducts(ctx, products); err != nil {
+			if err := s.changeDetector.ProcessScrapedProducts(ctx, products, s.scraper); err != nil {
 				s.logger.Error("change detection failed", "error", err)
 			} else {
 				s.logger.Info("change detection completed")
