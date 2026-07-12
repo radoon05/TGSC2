@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 	"tgsc/internal/logger"
 	"tgsc/internal/repository"
 	"tgsc/internal/scraper"
-	"tgsc/internal/sync"
+	syncpkg "tgsc/internal/sync" // 🔥 alias برای جلوگیری از تداخل با پکیج sync
 	"tgsc/internal/woo"
 )
 
@@ -35,9 +36,11 @@ func main() {
 	log := logger.New(cfg.LogLevel)
 	slog.SetDefault(log.Logger)
 
-	log.Info("starting scraper-sync service (dual-worker architecture)")
+	log.Info("starting scraper-sync service (improved architecture)")
 
-	// Connect to database
+	// ============================================================
+	//  دیتابیس
+	// ============================================================
 	dbPool, err := pgxpool.New(context.Background(), cfg.Database.URL)
 	if err != nil {
 		log.Error("failed to connect to database", "error", err)
@@ -46,47 +49,69 @@ func main() {
 	defer dbPool.Close()
 	log.Info("database connected")
 
-	// Run migrations
 	if err := runMigrations(cfg.Database.URL); err != nil {
 		log.Error("migration failed", "error", err)
 		os.Exit(1)
 	}
 	log.Info("migrations applied")
 
-	// Create repositories
+	// ============================================================
+	//  Repository‌ها
+	// ============================================================
 	productRepo := repository.NewProductRepository(dbPool)
 	syncJobRepo := repository.NewSyncJobRepository(dbPool)
 
-	// Create scraper with login credentials
+	// ============================================================
+	//  Scraper (با مدیریت خطا)
+	// ============================================================
 	categories := config.GetCategories()
-	scraperClient := scraper.NewClient(
+	scraperClient, err := scraper.NewClient(
 		&cfg.Scraper,
 		cfg.Eways.LoginURL,
 		cfg.Eways.Username,
 		cfg.Eways.Password,
 		categories,
 	)
+	if err != nil {
+		log.Error("failed to create scraper client", "error", err)
+		os.Exit(1)
+	}
+	log.Info("scraper client created")
 
-	// Create Woo client
+	// ============================================================
+	//  Woo Client
+	// ============================================================
 	wooClient := woo.NewClient(
 		cfg.Woo.BaseURL,
 		cfg.Woo.ConsumerKey,
 		cfg.Woo.ConsumerSecret,
 		cfg.Woo.Timeout,
 		cfg.Woo.RateLimit,
-		cfg.Woo.BatchCreateSize,
-		cfg.Woo.BatchUpdateSize,
 		cfg.App.IsDryRun,
-		cfg.App.FixedCost,
-		cfg.App.RoundTo,
+	)
+	log.Info("woo client created", "dry_run", cfg.App.IsDryRun)
+
+	// ============================================================
+	//  Normalizer
+	// ============================================================
+	normalizer := syncpkg.NewNormalizer(cfg.App.FixedCost, cfg.App.RoundTo)
+
+	// ============================================================
+	//  Change Detector
+	// ============================================================
+	// در ساخت ChangeDetector، dbPool را هم پاس دهید:
+	changeDetector := syncpkg.NewChangeDetector(
+		productRepo,
+		syncJobRepo,
+		normalizer,
+		categories,
+		dbPool, // 🔥 اضافه شد
 	)
 
-	// Create normalizer and change detector
-	normalizer := sync.NewNormalizer()
-	changeDetector := sync.NewChangeDetector(productRepo, syncJobRepo, normalizer)
-
-	// Create engine configuration
-	engineCfg := &sync.EngineConfig{
+	// ============================================================
+	//  Engine
+	// ============================================================
+	engineCfg := &syncpkg.EngineConfig{
 		UpdateWorkerCount: cfg.Sync.UpdateWorkerCount,
 		UpdateFetchLimit:  cfg.Sync.UpdateFetchLimit,
 		UpdateBatchSize:   cfg.Sync.UpdateBatchSize,
@@ -95,59 +120,92 @@ func main() {
 		CreateBatchSize:   cfg.Sync.CreateBatchSize,
 		RetryBackoffBase:  cfg.Sync.RetryBackoffBase,
 		MaxRetries:        cfg.Sync.MaxRetries,
+		DryRun:            cfg.App.IsDryRun,
 	}
 
-	// Create engine with separate worker pools
-	engine := sync.NewEngine(syncJobRepo, productRepo, wooClient, log, engineCfg)
+	engine := syncpkg.NewEngine(syncJobRepo, productRepo, wooClient, log, engineCfg)
+
 	ctx, cancel := context.WithCancel(context.Background())
-	engine.Start(ctx)
+	defer cancel()
+
+	if !cfg.App.IsDryRun {
+		engine.Start(ctx)
+		log.Info("engine started (real mode)")
+	} else {
+		log.Info("engine NOT started (dry-run mode)")
+	}
 
 	// ============================================================
-	// 🔥 Schedulerها با ارسال scraperClient برای دریافت جزئیات
+	//  Scheduler واحد
 	// ============================================================
+	var isScraping bool
+	var scrapeMutex sync.Mutex
 
-	// Scheduler 1: Update (every 2 hours)
-	updateScraperScheduler := sync.NewScraperScheduler(
-		scraperClient,
-		changeDetector,
-		log.Named("update-scraper"),
-		2*time.Hour,
-	)
-	updateScraperScheduler.Start(ctx)
+	scrapeFunc := func() {
+		scrapeMutex.Lock()
+		if isScraping {
+			scrapeMutex.Unlock()
+			log.Info("scrape already running, skipping")
+			return
+		}
+		isScraping = true
+		scrapeMutex.Unlock()
 
-	// Scheduler 2: Create (every 12 hours)
-	createScraperScheduler := sync.NewScraperScheduler(
-		scraperClient,
-		changeDetector,
-		log.Named("create-scraper"),
-		4*time.Hour,
-	)
-	createScraperScheduler.Start(ctx)
+		defer func() {
+			scrapeMutex.Lock()
+			isScraping = false
+			scrapeMutex.Unlock()
+		}()
+
+		log.Info("scrape started")
+		products, err := scraperClient.FetchProducts(ctx)
+		if err != nil {
+			log.Error("scrape failed", "error", err)
+			return
+		}
+		log.Info("scrape completed", "product_count", len(products))
+		if len(products) == 0 {
+			return
+		}
+		if err := changeDetector.ProcessScrapedProducts(ctx, products, scraperClient); err != nil {
+			log.Error("change detection failed", "error", err)
+		} else {
+			log.Info("change detection completed")
+		}
+	}
+
+	scraperScheduler := NewScraperScheduler(scrapeFunc, 2*time.Hour, log.Named("scheduler"))
+	scraperScheduler.Start(ctx)
+
+	go func() {
+		time.Sleep(5 * time.Second)
+		scrapeFunc()
+	}()
 
 	// ============================================================
 	//  HTTP Handlers
 	// ============================================================
-
 	mux := http.NewServeMux()
 
+	// Health
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		if err := dbPool.Ping(ctx); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, `{"status": "down", "error": "%s"}`, err.Error())
+			json.NewEncoder(w).Encode(map[string]string{"status": "down", "error": err.Error()})
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status": "ok"}`)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
+	// Metrics
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "# Metrics endpoint\n")
 	})
 
+	// Debug raw
 	mux.HandleFunc("POST /debug-raw", func(w http.ResponseWriter, r *http.Request) {
 		log := logger.New(cfg.LogLevel).Named("debug")
 		log.Info("debug raw response triggered")
@@ -155,19 +213,25 @@ func main() {
 		testCategories := []config.Category{
 			{Name: "قاب و کاور اپل", EwaysCatID: "19136", WPCatID: 365, PriceCoeff: 1.10},
 		}
-		testScraper := scraper.NewClient(
+		testScraper, err := scraper.NewClient(
 			&cfg.Scraper,
 			cfg.Eways.LoginURL,
 			cfg.Eways.Username,
 			cfg.Eways.Password,
 			testCategories,
 		)
+		if err != nil {
+			log.Error("failed to create test scraper", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to create scraper: " + err.Error()})
+			return
+		}
 
 		ctx := r.Context()
 		if err := testScraper.Login(ctx); err != nil {
 			log.Error("login failed", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, `{"error": "login failed: %s"}`, err.Error())
+			json.NewEncoder(w).Encode(map[string]string{"error": "login failed: " + err.Error()})
 			return
 		}
 
@@ -179,37 +243,53 @@ func main() {
 		if err != nil {
 			log.Error("fetch raw failed", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
 
 		log.Info("raw response", "body", string(rawBody))
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status": "ok", "raw": %s}`, string(rawBody))
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"raw":    string(rawBody),
+		})
 	})
 
+	// Run full scrape
 	mux.HandleFunc("POST /run-scrape", func(w http.ResponseWriter, r *http.Request) {
-		log := logger.New(cfg.LogLevel).Named("manual")
-		log.Info("manual scrape triggered")
+		go func() {
+			log := logger.New(cfg.LogLevel).Named("manual")
+			log.Info("full scrape triggered - running in background")
 
-		products, err := scraperClient.FetchProducts(r.Context())
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
-			return
-		}
-		// 🔥 ارسال scraperClient برای دریافت جزئیات
-		if err := changeDetector.ProcessScrapedProducts(r.Context(), products, scraperClient); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, `{"error": "%s"}`, err.Error())
-			return
-		}
+			if err := scraperClient.RefreshSession(ctx); err != nil {
+				log.Error("refresh session failed", "error", err)
+				return
+			}
+
+			products, err := scraperClient.FetchProducts(ctx)
+			if err != nil {
+				log.Error("scrape failed", "error", err)
+				return
+			}
+			log.Info("scrape completed", "product_count", len(products))
+			if len(products) == 0 {
+				return
+			}
+			if err := changeDetector.ProcessScrapedProducts(ctx, products, scraperClient); err != nil {
+				log.Error("change detection failed", "error", err)
+			} else {
+				log.Info("change detection completed")
+			}
+		}()
+
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, `{"status": "ok", "products": %d}`, len(products))
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "accepted",
+			"message": "full scrape started in background, check logs for results",
+		})
 	})
 
+	// Export products
 	mux.HandleFunc("GET /export-products", func(w http.ResponseWriter, r *http.Request) {
 		log := logger.New(cfg.LogLevel).Named("export")
 		log.Info("export products requested")
@@ -241,24 +321,23 @@ func main() {
 			var price float64
 			var stock int
 			var lastScrapedAt time.Time
-			err := rows.Scan(&sourceID, &title, &price, &stock, &fingerprint, &lastScrapedAt)
-			if err != nil {
+			if err := rows.Scan(&sourceID, &title, &price, &stock, &fingerprint, &lastScrapedAt); err != nil {
 				continue
 			}
 			count++
 			displayTitle := title
-			if len(displayTitle) > 50 {
-				displayTitle = displayTitle[:50] + "..."
+			if len([]rune(title)) > 50 {
+				displayTitle = string([]rune(title)[:50]) + "..."
 			}
 			fmt.Fprintf(w, "%-10s | %-50s | %12.0f | %6d | %s\n",
 				sourceID, displayTitle, price, stock, lastScrapedAt.Format("2006-01-02 15:04"))
 		}
-
 		fmt.Fprintf(w, "\n================================\n")
 		fmt.Fprintf(w, "تعداد کل محصولات: %d\n", count)
 		log.Info("export completed", "count", count)
 	})
 
+	// Test scrape
 	mux.HandleFunc("POST /test-scrape", func(w http.ResponseWriter, r *http.Request) {
 		log := logger.New(cfg.LogLevel).Named("test")
 		log.Info("test scrape triggered - running in background")
@@ -266,16 +345,21 @@ func main() {
 		testCategories := []config.Category{
 			{Name: "test cat", EwaysCatID: "18482", WPCatID: 38, PriceCoeff: 1.2},
 		}
-		testScraper := scraper.NewClient(
+		testScraper, err := scraper.NewClient(
 			&cfg.Scraper,
 			cfg.Eways.LoginURL,
 			cfg.Eways.Username,
 			cfg.Eways.Password,
 			testCategories,
 		)
+		if err != nil {
+			log.Error("failed to create test scraper", "error", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "failed to create scraper: " + err.Error()})
+			return
+		}
 
 		go func() {
-			ctx := context.Background()
 			products, err := testScraper.FetchProducts(ctx)
 			if err != nil {
 				log.Error("test scrape failed", "error", err)
@@ -285,7 +369,6 @@ func main() {
 			if len(products) == 0 {
 				return
 			}
-			// 🔥 ارسال scraperClient برای دریافت جزئیات
 			if err := changeDetector.ProcessScrapedProducts(ctx, products, testScraper); err != nil {
 				log.Error("test change detection failed", "error", err)
 			} else {
@@ -304,12 +387,11 @@ func main() {
 	// ============================================================
 	//  HTTP Server
 	// ============================================================
-
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.HTTPPort,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -324,16 +406,17 @@ func main() {
 	// ============================================================
 	//  Graceful Shutdown
 	// ============================================================
-
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info("shutting down gracefully...")
 
 	cancel()
-	engine.Stop()
-	updateScraperScheduler.Stop()
-	createScraperScheduler.Stop()
+
+	if !cfg.App.IsDryRun {
+		engine.Stop()
+	}
+	scraperScheduler.Stop()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -343,7 +426,76 @@ func main() {
 	log.Info("service stopped")
 }
 
-// runMigrations applies SQL migrations by executing .up.sql files in order.
+// ============================================================
+//  ScraperScheduler
+// ============================================================
+
+type ScraperScheduler struct {
+	fn       func()
+	interval time.Duration
+	logger   *logger.Logger
+	stopChan chan struct{}
+	running  bool
+	mu       sync.Mutex
+}
+
+func NewScraperScheduler(fn func(), interval time.Duration, log *logger.Logger) *ScraperScheduler {
+	return &ScraperScheduler{
+		fn:       fn,
+		interval: interval,
+		logger:   log,
+		stopChan: make(chan struct{}),
+	}
+}
+
+func (s *ScraperScheduler) Start(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return
+	}
+	s.running = true
+	go s.run(ctx)
+}
+
+func (s *ScraperScheduler) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return
+	}
+	s.running = false
+	select {
+	case <-s.stopChan:
+	default:
+		close(s.stopChan)
+	}
+}
+
+func (s *ScraperScheduler) run(ctx context.Context) {
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+
+	s.logger.Info("scheduler started", "interval", s.interval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("scheduler stopped due to context cancellation")
+			return
+		case <-s.stopChan:
+			s.logger.Info("scheduler stopped by stop signal")
+			return
+		case <-ticker.C:
+			s.fn()
+		}
+	}
+}
+
+// ============================================================
+//  runMigrations
+// ============================================================
+
 func runMigrations(databaseURL string) error {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {

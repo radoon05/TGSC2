@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	// "log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -23,9 +23,9 @@ import (
 	"tgsc/internal/domain"
 )
 
-// ================================================================
-//  Client
-// ================================================================
+// ============================================================
+//  Client (بدون fixedCost و roundTo - اسکرپر فقط داده خام می‌گیرد)
+// ============================================================
 
 type Client struct {
 	httpClient   *http.Client
@@ -40,17 +40,18 @@ type Client struct {
 	categories   []config.Category
 	loggedIn     bool
 	mu           sync.Mutex
+	// fixedCost و roundTo حذف شدند - قیمت‌ها در Normalizer محاسبه می‌شوند
 }
 
-// NewClient creates a new scraper client with authentication and category support.
+// NewClient با ۵ پارامتر (بدون fixedCost و roundTo)
 func NewClient(
 	cfg *config.ScraperConfig,
 	loginURL, username, password string,
 	categories []config.Category,
-) *Client {
+) (*Client, error) {
 	cookies, err := GetEwaysCookies(username, password, loginURL)
 	if err != nil {
-		log.Fatalf("❌ خطا در دریافت کوکی: %v", err)
+		return nil, fmt.Errorf("دریافت کوکی: %w", err)
 	}
 
 	jar, _ := cookiejar.New(nil)
@@ -72,12 +73,13 @@ func NewClient(
 		pageSize:     24,
 		categories:   categories,
 		loggedIn:     true,
-	}
+	}, nil
 }
 
-// ================================================================
+
+// ============================================================
 //  لاگین
-// ================================================================
+// ============================================================
 
 func (c *Client) login(ctx context.Context) error {
 	c.mu.Lock()
@@ -116,9 +118,24 @@ func (c *Client) Login(ctx context.Context) error {
 	return c.login(ctx)
 }
 
-// ================================================================
+// RefreshSession کوکی را تازه‌سازی می‌کند (لاگین مجدد)
+func (c *Client) RefreshSession(ctx context.Context) error {
+	c.mu.Lock()
+	c.loggedIn = false
+	c.mu.Unlock()
+	return c.login(ctx)
+}
+
+// UpdateCategories دسته‌بندی‌ها را به‌روز می‌کند (برای reload بدون ری‌استارت)
+func (c *Client) UpdateCategories(categories []config.Category) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.categories = categories
+}
+
+// ============================================================
 //  دریافت محصولات (اسکرپ اصلی)
-// ================================================================
+// ============================================================
 
 func (c *Client) FetchProducts(ctx context.Context) ([]*domain.Product, error) {
 	if err := c.login(ctx); err != nil {
@@ -132,6 +149,7 @@ func (c *Client) FetchProducts(ctx context.Context) ([]*domain.Product, error) {
 		}
 		products, err := c.fetchCategoryProducts(ctx, cat.EwaysCatID)
 		if err != nil {
+			// لاگ خطا ولی ادامه بده
 			continue
 		}
 		allProducts = append(allProducts, products...)
@@ -228,10 +246,19 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 
 	products := make([]*domain.Product, 0, len(ewaysResp.Goods))
 	for _, g := range ewaysResp.Goods {
+		// ============================================================
+		// 🔥 جلوگیری از انتشار محصول با قیمت صفر (تماس بگیرید)
+		// ============================================================
+		if g.Price <= 0 {
+			// این محصول را رد کن (می‌توانی لاگ کنی یا شمارش)
+			continue
+		}
+
 		products = append(products, &domain.Product{
 			SourceID:      strconv.Itoa(g.ID),
 			Title:         g.Name,
-			Price:         g.Price,
+			Price:         0, // 🔥 قیمت نهایی توسط Normalizer محاسبه می‌شود
+			SourcePrice:   g.Price, // 🔥 قیمت خام از ایویز (به ریال)
 			Stock:         g.Stock,
 			LastScrapedAt: time.Now(),
 			WPCatID:       wpCatID,
@@ -243,9 +270,9 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 	return products, true, nil
 }
 
-// ================================================================
+// ============================================================
 //  دریافت جزئیات کامل محصول (صفحه محصول)
-// ================================================================
+// ============================================================
 
 // EwaysProductDetail ساختار جزئیات کامل محصول از صفحه HTML
 type EwaysProductDetail struct {
@@ -260,12 +287,12 @@ type EwaysProductDetail struct {
 }
 
 // GetProductDetailFromPage با رفتن به صفحه محصول، اطلاعات را از HTML استخراج می‌کند
+// آدرس: https://panel.eways.co/Store/Detail/{categoryID}/{productID}
 func (c *Client) GetProductDetailFromPage(ctx context.Context, productID string, categoryID string) (*EwaysProductDetail, error) {
 	if err := c.rateLimiter.Wait(ctx); err != nil {
 		return nil, err
 	}
 
-	// 🔥 آدرس صحیح محصول در ایویز
 	url := fmt.Sprintf("https://panel.eways.co/Store/Detail/%s/%s", categoryID, productID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -290,34 +317,25 @@ func (c *Client) GetProductDetailFromPage(ctx context.Context, productID string,
 	}
 
 	detail := &EwaysProductDetail{
-		ID:     parseInt(productID),
-		Images: []string{},
+		ID:         parseInt(productID),
+		Images:     []string{},
 		Attributes: []struct {
 			Name  string `json:"Name"`
 			Value string `json:"Value"`
 		}{},
 	}
 
-	// ============================================================
-	// ۱. توضیحات محصول (اگر وجود داشته باشد)
-	// ============================================================
-	// فعلاً خالی می‌گذاریم – می‌توانید selector واقعی را جایگزین کنید
-	// مثال: doc.Find(".product-description").Text()
-	detail.Description = ""
+	// 1. توضیحات محصول – این سلکتور باید با کلاس واقعی ایویز جایگزین شود
+	detail.Description = strings.TrimSpace(doc.Find(".product-description").Text())
 
-	// ============================================================
-	// ۲. گالری تصاویر – استخراج از ویژگی onclick
-	// ============================================================
-	// ابتدا از تصویر اصلی (goods-image) تلاش می‌کنیم
+	// 2. گالری تصاویر – استخراج از ویژگی onclick
 	imgSelection := doc.Find(".goods-image img[onclick]")
 	if imgSelection.Length() > 0 {
 		onclick, exists := imgSelection.Attr("onclick")
 		if exists {
-			// استخراج آرایه تصاویر با regex
 			re := regexp.MustCompile(`ShowPhotoGalleryDialog\(\[(.*?)\],`)
 			matches := re.FindStringSubmatch(onclick)
 			if len(matches) > 1 {
-				// matches[1] شامل لیست URLها به صورت "url1","url2",...
 				parts := strings.Split(matches[1], ",")
 				for _, p := range parts {
 					p = strings.Trim(p, "\" ")
@@ -338,9 +356,7 @@ func (c *Client) GetProductDetailFromPage(ctx context.Context, productID string,
 		})
 	}
 
-	// ============================================================
-	// ۳. ویژگی‌ها (مشخصات فنی) – از جدول
-	// ============================================================
+	// 3. ویژگی‌ها (مشخصات فنی) – از جدول
 	doc.Find("#link1 .table tbody tr").Each(func(i int, s *goquery.Selection) {
 		name := strings.TrimSpace(s.Find("td.text-nowrap.bold").Text())
 		value := strings.TrimSpace(s.Find("td").Not(".text-nowrap.bold").Text())
@@ -361,9 +377,9 @@ func parseInt(s string) int {
 	return i
 }
 
-// ================================================================
+// ============================================================
 //  متدهای کمکی
-// ================================================================
+// ============================================================
 
 // FetchRaw یک درخواست POST با payload مشخص ارسال می‌کند و body خام را برمی‌گرداند
 func (c *Client) FetchRaw(ctx context.Context, payload string) ([]byte, error) {
@@ -385,9 +401,9 @@ func (c *Client) FetchRaw(ctx context.Context, payload string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// ================================================================
+// ============================================================
 //  ساختارهای پاسخ ایویز
-// ================================================================
+// ============================================================
 
 type EwaysResponse struct {
 	Goods []EwaysProduct `json:"Goods"`

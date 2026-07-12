@@ -8,32 +8,33 @@ import (
 	"tgsc/internal/domain"
 )
 
-// WooProduct represents the WooCommerce product schema (full version)
+// ============================================================
+//  ساختارهای ووکامرس
+// ============================================================
+
 type WooProduct struct {
 	ID            int64      `json:"id,omitempty"`
 	SKU           string     `json:"sku,omitempty"`
-	Name          string     `json:"name"`
-	RegularPrice  string     `json:"regular_price"`
-	StockQuantity int        `json:"stock_quantity"`
-	ManageStock   bool       `json:"manage_stock"`
+	Name          string     `json:"name,omitempty"`
+	RegularPrice  string     `json:"regular_price,omitempty"`
+	StockQuantity int        `json:"stock_quantity,omitempty"`
+	ManageStock   bool       `json:"manage_stock,omitempty"`
 	Status        string     `json:"status,omitempty"`
 	Description   string     `json:"description,omitempty"`
 	Categories    []WooCat   `json:"categories,omitempty"`
 	Images        []WooImage `json:"images,omitempty"`
 	Attributes    []WooAttr  `json:"attributes,omitempty"`
+	MetaData      []WooMeta  `json:"meta_data,omitempty"`
 }
 
-// WooCat represents a product category in WooCommerce
 type WooCat struct {
 	ID int `json:"id"`
 }
 
-// WooImage represents a product image in WooCommerce
 type WooImage struct {
 	Src string `json:"src"`
 }
 
-// WooAttr represents a product attribute in WooCommerce
 type WooAttr struct {
 	Name      string   `json:"name"`
 	Options   []string `json:"options"`
@@ -41,57 +42,32 @@ type WooAttr struct {
 	Variation bool     `json:"variation,omitempty"`
 }
 
-// MapDomainToWoo converts a domain product to WooCommerce product format with all fields
-func MapDomainToWoo(p *domain.Product, fixedCost, roundTo float64) *WooProduct {
-	// ============================================================
-	// ۱. محاسبه قیمت نهایی
-	// ============================================================
-	coeff := p.PriceCoeff
-	if coeff == 0 {
-		coeff = 1.0
-	}
+type WooMeta struct {
+	Key   string      `json:"key"`
+	Value interface{} `json:"value"`
+}
 
-	// تبدیل ریال به تومان
-	priceToman := p.Price / 10.0
-
-	// اعمال ضریب
-	priceWithCoeff := priceToman * coeff
-
-	// اضافه کردن هزینه ثابت
-	priceWithFixed := priceWithCoeff + fixedCost
-
-	// گرد کردن به مضرب roundTo
-	var finalPrice float64
-	if roundTo > 0 {
-		finalPrice = float64(int(priceWithFixed/roundTo+0.5)) * roundTo
-	} else {
-		finalPrice = priceWithFixed
-	}
-
-	// ============================================================
-	// ۲. ساخت محصول پایه
-	// ============================================================
+// ============================================================
+//  MapToCreate - برای ایجاد محصول جدید (همه فیلدها)
+// ============================================================
+func MapToCreate(p *domain.Product) *WooProduct {
 	wp := &WooProduct{
 		SKU:           p.SourceID,
 		Name:          p.Title,
-		RegularPrice:  fmt.Sprintf("%.0f", finalPrice),
+		RegularPrice:  fmt.Sprintf("%.0f", p.Price), // قیمت نهایی قبلاً توسط Normalizer محاسبه شده
 		StockQuantity: p.Stock,
 		ManageStock:   true,
 		Status:        "publish",
 	}
 
-	// ============================================================
-	// ۳. توضیحات محصول (اولویت با FullDescription، سپس config)
-	// ============================================================
+	// ۱. توضیحات
 	if p.FullDescription != "" {
 		wp.Description = p.FullDescription
 	} else if config.ProductDescriptionHTML != "" {
 		wp.Description = config.ProductDescriptionHTML
 	}
 
-	// ============================================================
-	// ۴. تصاویر محصول (اولویت با گالری، سپس ImageURL تکی)
-	// ============================================================
+	// ۲. تصاویر (گالری)
 	if len(p.GalleryImages) > 0 {
 		images := make([]WooImage, 0, len(p.GalleryImages))
 		for _, url := range p.GalleryImages {
@@ -106,11 +82,8 @@ func MapDomainToWoo(p *domain.Product, fixedCost, roundTo float64) *WooProduct {
 		wp.Images = []WooImage{{Src: p.ImageURL}}
 	}
 
-	// ============================================================
-	// ۵. ویژگی‌ها (Attributes) – تبدیل JSON به ساختار ووکامرس
-	// ============================================================
+	// ۳. ویژگی‌ها
 	if p.Attributes != "" {
-		// ساختار موقت برای خواندن از دیتابیس (همان ساختار ایویز)
 		var rawAttrs []struct {
 			Name  string `json:"Name"`
 			Value string `json:"Value"`
@@ -120,7 +93,7 @@ func MapDomainToWoo(p *domain.Product, fixedCost, roundTo float64) *WooProduct {
 			for _, a := range rawAttrs {
 				wooAttrs = append(wooAttrs, WooAttr{
 					Name:      a.Name,
-					Options:   []string{a.Value}, // هر مقدار به عنوان یک گزینه
+					Options:   []string{a.Value},
 					Visible:   true,
 					Variation: false,
 				})
@@ -129,12 +102,31 @@ func MapDomainToWoo(p *domain.Product, fixedCost, roundTo float64) *WooProduct {
 		}
 	}
 
-	// ============================================================
-	// ۶. دسته‌بندی
-	// ============================================================
+	// ۴. دسته‌بندی
 	if p.WPCatID > 0 {
 		wp.Categories = []WooCat{{ID: p.WPCatID}}
 	}
 
+	// ۵. متادیتا: قیمت خام از ایویز
+	if p.SourcePrice > 0 {
+		wp.MetaData = append(wp.MetaData, WooMeta{
+			Key:   "_source_price",
+			Value: p.SourcePrice,
+		})
+	}
+
 	return wp
+}
+
+// ============================================================
+//  MapToUpdate - برای آپدیت محصول (حداقلی: فقط قیمت و موجودی)
+// ============================================================
+func MapToUpdate(p *domain.Product) *WooProduct {
+	// فقط فیلدهای لازم برای آپدیت
+	return &WooProduct{
+		ID:            p.WooID,                      // شناسه ووکامرس (ضروری)
+		RegularPrice:  fmt.Sprintf("%.0f", p.Price), // قیمت نهایی
+		StockQuantity: p.Stock,                     // موجودی
+		// بقیه فیلدها ارسال نمی‌شوند تا از بازنویسی غیرضروری جلوگیری شود
+	}
 }
