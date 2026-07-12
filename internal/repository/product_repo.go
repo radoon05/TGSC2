@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,7 +40,7 @@ func NewProductRepository(db *pgxpool.Pool) ProductRepository {
 }
 
 // ============================================================
-//  UpsertProduct (با اصلاح JSON)
+//  UpsertProduct
 // ============================================================
 
 func (r *productRepo) UpsertProduct(ctx context.Context, p *domain.Product) (bool, error) {
@@ -73,13 +74,12 @@ func (r *productRepo) UpsertProduct(ctx context.Context, p *domain.Product) (boo
 	var returnedID string
 
 	// ============================================================
-	// 🔥 اصلاح: مدیریت فیلدهای JSON
+	// مدیریت فیلدهای JSON
 	// ============================================================
 
 	// ۱. Attributes: اگر خالی یا "null" باشد، NULL بفرست
 	var attributesJSON interface{}
 	if p.Attributes != "" && p.Attributes != "null" {
-		// بررسی اینکه آیا JSON معتبر است (اختیاری)
 		attributesJSON = p.Attributes
 	} else {
 		attributesJSON = nil
@@ -94,7 +94,6 @@ func (r *productRepo) UpsertProduct(ctx context.Context, p *domain.Product) (boo
 			return false, fmt.Errorf("marshal gallery images: %w", err)
 		}
 	}
-	// اگر len == 0 باشد، galleryJSON = nil باقی می‌ماند
 
 	err := r.db.QueryRow(ctx, query,
 		p.ID, p.SourceID, p.Title, p.Price, p.SourcePrice, p.Stock, p.Fingerprint, p.LastScrapedAt,
@@ -102,8 +101,8 @@ func (r *productRepo) UpsertProduct(ctx context.Context, p *domain.Product) (boo
 		p.WooID, p.DetailFetchedAt,
 		p.WPCatID, p.PriceCoeff, p.ImageURL, p.EwaysCatID,
 		p.FullDescription,
-		attributesJSON, // ← استفاده از attributesJSON
-		galleryJSON,    // ← استفاده از galleryJSON
+		attributesJSON,
+		galleryJSON,
 	).Scan(&returnedID, &created)
 	if err != nil {
 		return false, err
@@ -113,7 +112,7 @@ func (r *productRepo) UpsertProduct(ctx context.Context, p *domain.Product) (boo
 }
 
 // ============================================================
-//  FindByID
+//  FindByID (با اصلاح NULL برای attributes و gallery_images)
 // ============================================================
 
 func (r *productRepo) FindByID(ctx context.Context, id string) (*domain.Product, error) {
@@ -125,13 +124,16 @@ func (r *productRepo) FindByID(ctx context.Context, id string) (*domain.Product,
 	`
 	var p domain.Product
 	var galleryJSON []byte
+	var attributes sql.NullString // 🔥 برای مدیریت NULL
 
 	err := r.db.QueryRow(ctx, query, id).Scan(
 		&p.ID, &p.SourceID, &p.Title, &p.Price, &p.SourcePrice, &p.Stock, &p.Fingerprint,
 		&p.LastScrapedAt, &p.CreatedAt, &p.UpdatedAt,
 		&p.WooID, &p.DetailFetchedAt,
 		&p.WPCatID, &p.PriceCoeff, &p.ImageURL, &p.EwaysCatID,
-		&p.FullDescription, &p.Attributes, &galleryJSON,
+		&p.FullDescription,
+		&attributes, // ← استفاده از sql.NullString
+		&galleryJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -139,6 +141,11 @@ func (r *productRepo) FindByID(ctx context.Context, id string) (*domain.Product,
 	if err != nil {
 		return nil, err
 	}
+
+	// تبدیل Attributes
+	p.Attributes = attributes.String
+
+	// تجزیه JSON گالری تصاویر
 	if len(galleryJSON) > 0 {
 		_ = json.Unmarshal(galleryJSON, &p.GalleryImages)
 	}
@@ -146,7 +153,7 @@ func (r *productRepo) FindByID(ctx context.Context, id string) (*domain.Product,
 }
 
 // ============================================================
-//  FindBySourceID
+//  FindBySourceID (با اصلاح NULL برای attributes و gallery_images)
 // ============================================================
 
 func (r *productRepo) FindBySourceID(ctx context.Context, sourceID string) (*domain.Product, error) {
@@ -158,13 +165,16 @@ func (r *productRepo) FindBySourceID(ctx context.Context, sourceID string) (*dom
 	`
 	var p domain.Product
 	var galleryJSON []byte
+	var attributes sql.NullString // 🔥 برای مدیریت NULL
 
 	err := r.db.QueryRow(ctx, query, sourceID).Scan(
 		&p.ID, &p.SourceID, &p.Title, &p.Price, &p.SourcePrice, &p.Stock, &p.Fingerprint,
 		&p.LastScrapedAt, &p.CreatedAt, &p.UpdatedAt,
 		&p.WooID, &p.DetailFetchedAt,
 		&p.WPCatID, &p.PriceCoeff, &p.ImageURL, &p.EwaysCatID,
-		&p.FullDescription, &p.Attributes, &galleryJSON,
+		&p.FullDescription,
+		&attributes, // ← استفاده از sql.NullString
+		&galleryJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -172,6 +182,9 @@ func (r *productRepo) FindBySourceID(ctx context.Context, sourceID string) (*dom
 	if err != nil {
 		return nil, err
 	}
+
+	p.Attributes = attributes.String
+
 	if len(galleryJSON) > 0 {
 		_ = json.Unmarshal(galleryJSON, &p.GalleryImages)
 	}
@@ -251,7 +264,7 @@ func (r *productTxRepo) UpsertProduct(ctx context.Context, p *domain.Product) (b
 	var created bool
 	var returnedID string
 
-	// مدیریت JSON (همانند نسخه اصلی)
+	// مدیریت JSON
 	var attributesJSON interface{}
 	if p.Attributes != "" && p.Attributes != "null" {
 		attributesJSON = p.Attributes
@@ -293,13 +306,16 @@ func (r *productTxRepo) FindByID(ctx context.Context, id string) (*domain.Produc
 	`
 	var p domain.Product
 	var galleryJSON []byte
+	var attributes sql.NullString
 
 	err := r.tx.QueryRow(ctx, query, id).Scan(
 		&p.ID, &p.SourceID, &p.Title, &p.Price, &p.SourcePrice, &p.Stock, &p.Fingerprint,
 		&p.LastScrapedAt, &p.CreatedAt, &p.UpdatedAt,
 		&p.WooID, &p.DetailFetchedAt,
 		&p.WPCatID, &p.PriceCoeff, &p.ImageURL, &p.EwaysCatID,
-		&p.FullDescription, &p.Attributes, &galleryJSON,
+		&p.FullDescription,
+		&attributes,
+		&galleryJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -307,6 +323,8 @@ func (r *productTxRepo) FindByID(ctx context.Context, id string) (*domain.Produc
 	if err != nil {
 		return nil, err
 	}
+
+	p.Attributes = attributes.String
 	if len(galleryJSON) > 0 {
 		_ = json.Unmarshal(galleryJSON, &p.GalleryImages)
 	}
@@ -322,13 +340,16 @@ func (r *productTxRepo) FindBySourceID(ctx context.Context, sourceID string) (*d
 	`
 	var p domain.Product
 	var galleryJSON []byte
+	var attributes sql.NullString
 
 	err := r.tx.QueryRow(ctx, query, sourceID).Scan(
 		&p.ID, &p.SourceID, &p.Title, &p.Price, &p.SourcePrice, &p.Stock, &p.Fingerprint,
 		&p.LastScrapedAt, &p.CreatedAt, &p.UpdatedAt,
 		&p.WooID, &p.DetailFetchedAt,
 		&p.WPCatID, &p.PriceCoeff, &p.ImageURL, &p.EwaysCatID,
-		&p.FullDescription, &p.Attributes, &galleryJSON,
+		&p.FullDescription,
+		&attributes,
+		&galleryJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -336,6 +357,8 @@ func (r *productTxRepo) FindBySourceID(ctx context.Context, sourceID string) (*d
 	if err != nil {
 		return nil, err
 	}
+
+	p.Attributes = attributes.String
 	if len(galleryJSON) > 0 {
 		_ = json.Unmarshal(galleryJSON, &p.GalleryImages)
 	}
@@ -369,8 +392,7 @@ func NewProductTxRepo(tx pgx.Tx) *ProductTxRepo {
 }
 
 func (r *ProductTxRepo) UpsertProduct(ctx context.Context, p *domain.Product) (bool, error) {
-	// کد دقیقاً مشابه productTxRepo.UpsertProduct
-	// (برای جلوگیری از تکرار، می‌توان از productTxRepo استفاده کرد اما برای سادگی کپی می‌کنیم)
+	// همانند productTxRepo.UpsertProduct (برای جلوگیری از تکرار، می‌توان از productTxRepo استفاده کرد)
 	query := `
 		INSERT INTO products (
 			id, source_id, title, price, source_price, stock, fingerprint, last_scraped_at,
@@ -433,7 +455,6 @@ func (r *ProductTxRepo) UpsertProduct(ctx context.Context, p *domain.Product) (b
 }
 
 func (r *ProductTxRepo) FindByID(ctx context.Context, id string) (*domain.Product, error) {
-	// مشابه productTxRepo.FindByID
 	query := `
 		SELECT id, source_id, title, price, source_price, stock, fingerprint, last_scraped_at,
 		       created_at, updated_at, woo_id, detail_fetched_at, wp_cat_id, price_coeff,
@@ -442,13 +463,16 @@ func (r *ProductTxRepo) FindByID(ctx context.Context, id string) (*domain.Produc
 	`
 	var p domain.Product
 	var galleryJSON []byte
+	var attributes sql.NullString
 
 	err := r.tx.QueryRow(ctx, query, id).Scan(
 		&p.ID, &p.SourceID, &p.Title, &p.Price, &p.SourcePrice, &p.Stock, &p.Fingerprint,
 		&p.LastScrapedAt, &p.CreatedAt, &p.UpdatedAt,
 		&p.WooID, &p.DetailFetchedAt,
 		&p.WPCatID, &p.PriceCoeff, &p.ImageURL, &p.EwaysCatID,
-		&p.FullDescription, &p.Attributes, &galleryJSON,
+		&p.FullDescription,
+		&attributes,
+		&galleryJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -456,6 +480,8 @@ func (r *ProductTxRepo) FindByID(ctx context.Context, id string) (*domain.Produc
 	if err != nil {
 		return nil, err
 	}
+
+	p.Attributes = attributes.String
 	if len(galleryJSON) > 0 {
 		_ = json.Unmarshal(galleryJSON, &p.GalleryImages)
 	}
@@ -463,7 +489,6 @@ func (r *ProductTxRepo) FindByID(ctx context.Context, id string) (*domain.Produc
 }
 
 func (r *ProductTxRepo) FindBySourceID(ctx context.Context, sourceID string) (*domain.Product, error) {
-	// مشابه productTxRepo.FindBySourceID
 	query := `
 		SELECT id, source_id, title, price, source_price, stock, fingerprint, last_scraped_at,
 		       created_at, updated_at, woo_id, detail_fetched_at, wp_cat_id, price_coeff,
@@ -472,13 +497,16 @@ func (r *ProductTxRepo) FindBySourceID(ctx context.Context, sourceID string) (*d
 	`
 	var p domain.Product
 	var galleryJSON []byte
+	var attributes sql.NullString
 
 	err := r.tx.QueryRow(ctx, query, sourceID).Scan(
 		&p.ID, &p.SourceID, &p.Title, &p.Price, &p.SourcePrice, &p.Stock, &p.Fingerprint,
 		&p.LastScrapedAt, &p.CreatedAt, &p.UpdatedAt,
 		&p.WooID, &p.DetailFetchedAt,
 		&p.WPCatID, &p.PriceCoeff, &p.ImageURL, &p.EwaysCatID,
-		&p.FullDescription, &p.Attributes, &galleryJSON,
+		&p.FullDescription,
+		&attributes,
+		&galleryJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -486,6 +514,8 @@ func (r *ProductTxRepo) FindBySourceID(ctx context.Context, sourceID string) (*d
 	if err != nil {
 		return nil, err
 	}
+
+	p.Attributes = attributes.String
 	if len(galleryJSON) > 0 {
 		_ = json.Unmarshal(galleryJSON, &p.GalleryImages)
 	}
