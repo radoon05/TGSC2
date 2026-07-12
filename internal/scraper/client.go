@@ -76,7 +76,6 @@ func NewClient(
 	}, nil
 }
 
-
 // ============================================================
 //  لاگین
 // ============================================================
@@ -118,12 +117,23 @@ func (c *Client) Login(ctx context.Context) error {
 	return c.login(ctx)
 }
 
-// RefreshSession کوکی را تازه‌سازی می‌کند (لاگین مجدد)
+// RefreshSession با استفاده از chromedp کوکی را تازه‌سازی می‌کند (لاگین مجدد واقعی)
 func (c *Client) RefreshSession(ctx context.Context) error {
 	c.mu.Lock()
-	c.loggedIn = false
-	c.mu.Unlock()
-	return c.login(ctx)
+	defer c.mu.Unlock()
+
+	// ۱. دریافت کوکی جدید با chromedp
+	cookies, err := GetEwaysCookies(c.username, c.password, c.loginURL)
+	if err != nil {
+		return fmt.Errorf("refresh session with chromedp: %w", err)
+	}
+
+	// ۲. به‌روزرسانی CookieJar
+	u, _ := url.Parse("https://panel.eways.co")
+	c.httpClient.Jar.SetCookies(u, cookies)
+	c.loggedIn = true
+
+	return nil
 }
 
 // UpdateCategories دسته‌بندی‌ها را به‌روز می‌کند (برای reload بدون ری‌استارت)
@@ -233,10 +243,12 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 	// پیدا کردن اطلاعات دسته‌بندی
 	var wpCatID int
 	var priceCoeff float64
+	var titlePrefix string // ← اضافه شد
 	for _, cat := range c.categories {
 		if cat.EwaysCatID == catID {
 			wpCatID = cat.WPCatID
 			priceCoeff = cat.PriceCoeff
+			titlePrefix = cat.TitlePrefix // ← دریافت پیشوند
 			break
 		}
 	}
@@ -256,9 +268,9 @@ func (c *Client) fetchPage(ctx context.Context, catID, payload string) ([]*domai
 
 		products = append(products, &domain.Product{
 			SourceID:      strconv.Itoa(g.ID),
-			Title:         g.Name,
-			Price:         0, // 🔥 قیمت نهایی توسط Normalizer محاسبه می‌شود
-			SourcePrice:   g.Price, // 🔥 قیمت خام از ایویز (به ریال)
+			Title:         titlePrefix + g.Name, // ← ترکیب پیشوند با عنوان
+			Price:         0,
+			SourcePrice:   g.Price,
 			Stock:         g.Stock,
 			LastScrapedAt: time.Now(),
 			WPCatID:       wpCatID,
@@ -317,8 +329,8 @@ func (c *Client) GetProductDetailFromPage(ctx context.Context, productID string,
 	}
 
 	detail := &EwaysProductDetail{
-		ID:         parseInt(productID),
-		Images:     []string{},
+		ID:     parseInt(productID),
+		Images: []string{},
 		Attributes: []struct {
 			Name  string `json:"Name"`
 			Value string `json:"Value"`

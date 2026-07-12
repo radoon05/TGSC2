@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"time"
+	"errors"
 
 	"tgsc/internal/domain"
 	"tgsc/internal/logger"
@@ -218,10 +219,10 @@ func (e *Engine) buildBatches(jobs []*domain.SyncJob, batchSize int) []*batch {
 //  createBatchTask
 // ============================================================
 
-func (e *Engine) createBatchTask(ctx context.Context, b *batch) Task {
-	return func(taskCtx context.Context) error {
-		return e.processBatch(taskCtx, b)
-	}
+func (e *Engine) createBatchTask(_ context.Context, b *batch) Task {
+    return func(taskCtx context.Context) error {
+        return e.processBatch(taskCtx, b)
+    }
 }
 
 // ============================================================
@@ -316,7 +317,7 @@ func (e *Engine) processBatch(ctx context.Context, b *batch) error {
 			if errMsg == "" {
 				errMsg = "unknown error"
 			}
-			e.handleJobFailure(ctx, job, fmt.Errorf(errMsg))
+			e.handleJobFailure(ctx, job, errors.New(errMsg))
 		}
 	}
 

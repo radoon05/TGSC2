@@ -140,6 +140,8 @@ func main() {
 	// ============================================================
 	var isScraping bool
 	var scrapeMutex sync.Mutex
+	var isManualScraping bool
+	var manualScrapeMutex sync.Mutex
 
 	scrapeFunc := func() {
 		scrapeMutex.Lock()
@@ -256,10 +258,31 @@ func main() {
 
 	// Run full scrape
 	mux.HandleFunc("POST /run-scrape", func(w http.ResponseWriter, r *http.Request) {
-		go func() {
-			log := logger.New(cfg.LogLevel).Named("manual")
-			log.Info("full scrape triggered - running in background")
+		manualScrapeMutex.Lock()
+		if isManualScraping {
+			manualScrapeMutex.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "conflict",
+				"message": "manual scrape already running",
+			})
+			return
+		}
+		isManualScraping = true
+		manualScrapeMutex.Unlock()
 
+		go func() {
+			defer func() {
+				manualScrapeMutex.Lock()
+				isManualScraping = false
+				manualScrapeMutex.Unlock()
+			}()
+
+			log := logger.New(cfg.LogLevel).Named("manual")
+			log.Info("manual full scrape triggered")
+
+			// Refresh session
 			if err := scraperClient.RefreshSession(ctx); err != nil {
 				log.Error("refresh session failed", "error", err)
 				return

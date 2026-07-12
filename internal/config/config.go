@@ -108,11 +108,11 @@ var defaultCategories = []Category{
 	{Name: "قاب و کاور هوآوی", EwaysCatID: "1168", WPCatID: 371, PriceCoeff: 1.10, TitlePrefix: ""},
 
 	// 2. محافظ صفحه نمایش (گلس)
-	{Name: "محافظ صفحه نمایش موبایل آیفون", EwaysCatID: "3374", WPCatID: 373, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
+	{Name: "محافظ صفحه نمایش موبایل آیفون", EwaysCatID: "3353", WPCatID: 373, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
 	{Name: "محافظ صفحه نمایش موبایل سامسونگ", EwaysCatID: "3354", WPCatID: 375, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
 	{Name: "محافظ صفحه نمایش موبایل شیائومی", EwaysCatID: "3374", WPCatID: 377, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
 	{Name: "محافظ صفحه نمایش موبایل ریل می", EwaysCatID: "19667", WPCatID: 379, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
-	{Name: "محافظ صفحه نمایش موبایل هوآوی", EwaysCatID: "3374", WPCatID: 381, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
+	{Name: "محافظ صفحه نمایش موبایل هوآوی", EwaysCatID: "3355", WPCatID: 381, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
 
 	// 3. ساعت هوشمند
 	{Name: "ساعت هوشمند", EwaysCatID: "14548", WPCatID: 357, PriceCoeff: 1.12, TitlePrefix: ""},

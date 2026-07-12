@@ -213,23 +213,6 @@ func (r *syncJobRepo) MarkAsDeadLetter(ctx context.Context, jobID string, reason
 	return err
 }
 
-func (r *syncJobRepo) RecoverStaleJobs(ctx context.Context) (int64, error) {
-	query := `
-		UPDATE sync_jobs
-		SET state = 'FAILED',
-		    last_error = 'job timed out (stale running)',
-		    updated_at = NOW(),
-		    finished_at = NOW()
-		WHERE state = 'RUNNING'
-		  AND started_at < NOW() - INTERVAL '15 minutes'
-	`
-	result, err := r.db.Exec(ctx, query)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 // ============================================================
 //  syncJobTxRepo (نسخه تراکنشی با pgx.Tx)
 // ============================================================
@@ -418,19 +401,20 @@ func (r *SyncJobTxRepo) MarkAsDeadLetter(ctx context.Context, jobID string, reas
 	return err
 }
 
-func (r *SyncJobTxRepo) RecoverStaleJobs(ctx context.Context) (int64, error) {
-	query := `
-		UPDATE sync_jobs
-		SET state = 'FAILED',
-		    last_error = 'job timed out (stale running)',
-		    updated_at = NOW(),
-		    finished_at = NOW()
-		WHERE state = 'RUNNING'
-		  AND started_at < NOW() - INTERVAL '15 minutes'
-	`
-	result, err := r.tx.Exec(ctx, query)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+func (r *syncJobRepo) RecoverStaleJobs(ctx context.Context) (int64, error) {
+    query := `
+        UPDATE sync_jobs
+        SET state = 'PENDING',
+            last_error = 'job recovered from stale running state',
+            scheduled_at = NOW() + INTERVAL '1 minute',
+            updated_at = NOW(),
+            finished_at = NULL
+        WHERE state = 'RUNNING'
+          AND started_at < NOW() - INTERVAL '15 minutes'
+    `
+    result, err := r.db.Exec(ctx, query)
+    if err != nil {
+        return 0, err
+    }
+    return result.RowsAffected(), nil
 }
