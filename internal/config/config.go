@@ -2,10 +2,9 @@ package config
 
 import (
 	"database/sql"
-	// "log"
+	"log"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -88,69 +87,11 @@ type Category struct {
 }
 
 var (
-	Categories   []Category
-	FixedCost    float64
-	RoundTo      float64
-	IsDryRun     bool
-	db           *sql.DB
-	mu           sync.RWMutex
+	Categories []Category
+	FixedCost  float64
+	RoundTo    float64
+	IsDryRun   bool
 )
-
-// ================================================================
-//  لیست کامل دسته‌بندی‌ها (پیش‌فرض)
-// ================================================================
-
-var defaultCategories = []Category{
-	// 1. قاب و کاور
-	{Name: "قاب و کاور اپل", EwaysCatID: "19136", WPCatID: 365, PriceCoeff: 1.10, TitlePrefix: ""},
-	{Name: "قاب و کاور سامسونگ", EwaysCatID: "19178", WPCatID: 367, PriceCoeff: 1.10, TitlePrefix: ""},
-	{Name: "قاب و کاور شیائومی", EwaysCatID: "2470", WPCatID: 369, PriceCoeff: 1.10, TitlePrefix: ""},
-	{Name: "قاب و کاور هوآوی", EwaysCatID: "1168", WPCatID: 371, PriceCoeff: 1.10, TitlePrefix: ""},
-
-	// 2. محافظ صفحه نمایش (گلس)
-	{Name: "محافظ صفحه نمایش موبایل آیفون", EwaysCatID: "3353", WPCatID: 373, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
-	{Name: "محافظ صفحه نمایش موبایل سامسونگ", EwaysCatID: "3354", WPCatID: 375, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
-	{Name: "محافظ صفحه نمایش موبایل شیائومی", EwaysCatID: "3374", WPCatID: 377, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
-	{Name: "محافظ صفحه نمایش موبایل ریل می", EwaysCatID: "19667", WPCatID: 379, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
-	{Name: "محافظ صفحه نمایش موبایل هوآوی", EwaysCatID: "3355", WPCatID: 381, PriceCoeff: 1.3, TitlePrefix: "گلس و "},
-
-	// 3. ساعت هوشمند
-	{Name: "ساعت هوشمند", EwaysCatID: "14548", WPCatID: 357, PriceCoeff: 1.12, TitlePrefix: ""},
-	{Name: "بند ساعت هوشمند", EwaysCatID: "9251", WPCatID: 385, PriceCoeff: 1.16, TitlePrefix: ""},
-
-	// 4. لوازم صوتی
-	{Name: "هدفون، هندزفری و هدست", EwaysCatID: "1593", WPCatID: 359, PriceCoeff: 1.1, TitlePrefix: ""},
-	{Name: "هدفون", EwaysCatID: "2550", WPCatID: 395, PriceCoeff: 1.06, TitlePrefix: ""},
-	{Name: "هندزفری باسیم", EwaysCatID: "2390", WPCatID: 397, PriceCoeff: 1.06, TitlePrefix: ""},
-	{Name: "هندزفری گردنی", EwaysCatID: "12898", WPCatID: 399, PriceCoeff: 1.06, TitlePrefix: ""},
-	{Name: "ایرفون و ایرپادز", EwaysCatID: "12896", WPCatID: 360, PriceCoeff: 1.08, TitlePrefix: ""},
-
-	// 5. پاوربانک
-	{Name: "پاوربانک ۱۰٬۰۰۰ میلی‌آمپر", EwaysCatID: "13091", WPCatID: 387, PriceCoeff: 1.3, TitlePrefix: ""},
-	{Name: "پاوربانک ۲۰٬۰۰۰ میلی‌آمپر", EwaysCatID: "13092", WPCatID: 389, PriceCoeff: 1.3, TitlePrefix: ""},
-	{Name: "پاوربانک ۳۰٬۰۰۰ میلی‌آمپر", EwaysCatID: "18058", WPCatID: 391, PriceCoeff: 1.3, TitlePrefix: ""},
-
-	// 6. لوازم جانبی موبایل
-	{Name: "آداپتور شارژر", EwaysCatID: "1585", WPCatID: 401, PriceCoeff: 1.16, TitlePrefix: ""},
-	{Name: "شارژر گوشی", EwaysCatID: "1585", WPCatID: 407, PriceCoeff: 1.16, TitlePrefix: ""},
-	{Name: "شارژر فندکی", EwaysCatID: "1609", WPCatID: 409, PriceCoeff: 1.2, TitlePrefix: ""},
-	{Name: "کابل شارژر", EwaysCatID: "1587", WPCatID: 403, PriceCoeff: 1.12, TitlePrefix: ""},
-	{Name: "محافظ کابل شارژر", EwaysCatID: "2675", WPCatID: 413, PriceCoeff: 1.15, TitlePrefix: ""},
-	{Name: "تبدیل ها", EwaysCatID: "2685", WPCatID: 415, PriceCoeff: 1.08, TitlePrefix: ""},
-	{Name: "هولدر و نگهدارنده موبایل", EwaysCatID: "2371", WPCatID: 411, PriceCoeff: 1.22, TitlePrefix: ""},
-
-	// 7. ذخیره‌سازی
-	{Name: "کارت حافظه و رم", EwaysCatID: "1396", WPCatID: 417, PriceCoeff: 1.2, TitlePrefix: "رم "},
-	{Name: "فلش مموری", EwaysCatID: "1395", WPCatID: 418, PriceCoeff: 1.1, TitlePrefix: "فلش "},
-	{Name: "هارد اکسترنال", EwaysCatID: "9426", WPCatID: 421, PriceCoeff: 1.2, TitlePrefix: ""},
-	{Name: "هارد SSD", EwaysCatID: "9752", WPCatID: 423, PriceCoeff: 1.05, TitlePrefix: ""},
-
-	// 8. تعمیرات موبایل
-	{Name: "تاچ ال سی و تعمیرات موبایل", EwaysCatID: "17496", WPCatID: 363, PriceCoeff: 1.07, TitlePrefix: "تاچ ال سی دی "},
-
-	// 9. کیف و کوله پشتی
-	{Name: "کیف و کوله پشتی", EwaysCatID: "20761", WPCatID: 364, PriceCoeff: 1.04, TitlePrefix: ""},
-}
 
 // ================================================================
 //  توابع اصلی
@@ -159,7 +100,7 @@ var defaultCategories = []Category{
 func Load() *Config {
 	cfg := &Config{
 		Database: DatabaseConfig{
-			URL: getEnv("DATABASE_URL", "postgres://scraper:scraper123@postgres:5432/scraper_sync?sslmode=disable"),
+			URL: getEnv("DATABASE_URL", "postgres://scraper:scraper123@localhost:5432/scraper_sync?sslmode=disable"),
 		},
 		Scraper: ScraperConfig{
 			BaseURL:      getEnv("SCRAPER_BASE_URL", "https://panel.eways.co/Store/ListLazy"),
@@ -189,9 +130,9 @@ func Load() *Config {
 			MaxRetries:        getEnvInt("SYNC_MAX_RETRIES", 3),
 		},
 		App: AppConfig{
-			FixedCost:   getEnvFloat("FIXED_COST", 50000),
-			RoundTo:     getEnvFloat("ROUND_TO", 1000),
-			IsDryRun:    getEnvBool("IS_DRY_RUN", true),
+			FixedCost:   getEnvFloat("FIXED_COST", 24000), // ← از دیتابیس شما
+			RoundTo:     getEnvFloat("ROUND_TO", 1000),    // ← از دیتابیس شما
+			IsDryRun:    getEnvBool("IS_DRY_RUN", false),
 			Description: ProductDescriptionHTML,
 		},
 		Eways: EwaysConfig{
@@ -203,27 +144,174 @@ func Load() *Config {
 		LogLevel: getEnv("LOG_LEVEL", "info"),
 	}
 
-	// مقداردهی Categories با لیست پیش‌فرض
-	Categories = defaultCategories
-
-	// اگر تمایل به بارگذاری از دیتابیس دارید، این بخش فعال شود
-	// اما فعلاً با لیست پیش‌فرض کار می‌کنیم
-	_ = LoadFromDB(cfg.Database.URL) // خطا را نادیده می‌گیریم
+	// 🔥 فقط از دیتابیس بخوان
+	if err := LoadFromDB(cfg.Database.URL); err != nil {
+		log.Printf("⚠️ بارگذاری از دیتابیس ناموفق: %v (ادامه با پیش‌فرض)", err)
+		// اگر دیتابیس خالی است، از fallback استفاده کن
+		Categories = fallbackCategories()
+		if err := SaveDefaultCategories(cfg.Database.URL); err != nil {
+			log.Printf("⚠️ ذخیره پیش‌فرض در دیتابیس ناموفق: %v", err)
+		}
+	} else {
+		log.Printf("✅ %d دسته‌بندی از دیتابیس بارگذاری شد.", len(Categories))
+		log.Printf("✅ هزینه ثابت: %.0f تومان, گرد کردن: %.0f", FixedCost, RoundTo)
+	}
 
 	return cfg
 }
 
-// LoadFromDB سعی در بارگذاری از دیتابیس دارد (اختیاری)
+// ================================================================
+//  بارگذاری از دیتابیس
+// ================================================================
+
 func LoadFromDB(databaseURL string) error {
-	// این بخش فعلاً غیرفعال است و فقط برای سازگاری نگهداری می‌شود
+	conn, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := conn.Ping(); err != nil {
+		return err
+	}
+
+	// ۱. خواندن fixed_cost و round_to
+	var fixedCost, roundTo float64
+	err = conn.QueryRow("SELECT fixed_cost, round_to FROM app_settings WHERE id = 1").Scan(&fixedCost, &roundTo)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// اگر جدول خالی است، از پیش‌فرض استفاده کن
+			fixedCost = 24000
+			roundTo = 1000
+			_, _ = conn.Exec(`
+				INSERT INTO app_settings (id, fixed_cost, round_to)
+				VALUES (1, $1, $2)
+				ON CONFLICT (id) DO NOTHING
+			`, fixedCost, roundTo)
+		} else {
+			return err
+		}
+	}
+	FixedCost = fixedCost
+	RoundTo = roundTo
+
+	// ۲. خواندن دسته‌بندی‌ها (با EwaysCatIDهای اصلاح‌شده)
+	rows, err := conn.Query(`
+		SELECT name, eways_cat_id, wp_cat_id, price_coeff, title_prefix, coefficient_type, fixed_profit
+		FROM categories ORDER BY id
+	`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var cats []Category
+	for rows.Next() {
+		var cat Category
+		var fixedProfit sql.NullFloat64
+		err := rows.Scan(&cat.Name, &cat.EwaysCatID, &cat.WPCatID, &cat.PriceCoeff,
+			&cat.TitlePrefix, &cat.CoefficientType, &fixedProfit)
+		if err != nil {
+			return err
+		}
+		if fixedProfit.Valid {
+			cat.FixedProfit = fixedProfit.Float64
+		}
+		cats = append(cats, cat)
+	}
+	Categories = cats
 	return nil
 }
 
-// GetCategories بازگرداندن لیست دسته‌بندی‌ها
-func GetCategories() []Category {
-	mu.RLock()
-	defer mu.RUnlock()
-	return Categories
+// ================================================================
+//  ذخیره دسته‌بندی‌های پیش‌فرض در دیتابیس (با CatIDهای اصلاح‌شده)
+// ================================================================
+
+func SaveDefaultCategories(databaseURL string) error {
+	conn, err := sql.Open("postgres", databaseURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// فقط اگر جدول خالی است، درج کن
+	var count int
+	if err := conn.QueryRow("SELECT COUNT(*) FROM categories").Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	for _, cat := range fallbackCategories() {
+		_, err := conn.Exec(`
+			INSERT INTO categories (name, eways_cat_id, wp_cat_id, price_coeff, title_prefix, coefficient_type, fixed_profit)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, cat.Name, cat.EwaysCatID, cat.WPCatID, cat.PriceCoeff,
+			cat.TitlePrefix, cat.CoefficientType, cat.FixedProfit)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ================================================================
+//  لیست پیش‌فرض (با CatIDهای اصلاح‌شده) - فقط برای اولین اجرا
+// ================================================================
+
+func fallbackCategories() []Category {
+	return []Category{
+		// 1. قاب و کاور
+		{Name: "قاب و کاور اپل", EwaysCatID: "19136", WPCatID: 365, PriceCoeff: 1.00, TitlePrefix: ""},
+		{Name: "قاب و کاور سامسونگ", EwaysCatID: "19178", WPCatID: 367, PriceCoeff: 1.00, TitlePrefix: ""},
+		{Name: "قاب و کاور شیائومی", EwaysCatID: "2470", WPCatID: 369, PriceCoeff: 1.00, TitlePrefix: ""},
+		{Name: "قاب و کاور هوآوی", EwaysCatID: "1168", WPCatID: 371, PriceCoeff: 1.00, TitlePrefix: ""},
+
+		// 2. محافظ صفحه نمایش (گلس) - 🔥 اصلاح CatIDهای تکراری
+		{Name: "محافظ صفحه نمایش موبایل آیفون", EwaysCatID: "3353", WPCatID: 373, PriceCoeff: 1.30, TitlePrefix: "گلس و ", CoefficientType: "percent"},
+		{Name: "محافظ صفحه نمایش موبایل سامسونگ", EwaysCatID: "3354", WPCatID: 375, PriceCoeff: 1.30, TitlePrefix: "گلس و ", CoefficientType: "percent"},
+		{Name: "محافظ صفحه نمایش موبایل شیائومی", EwaysCatID: "3374", WPCatID: 377, PriceCoeff: 1.30, TitlePrefix: "گلس و ", CoefficientType: "percent"},
+		{Name: "محافظ صفحه نمایش موبایل ریل می", EwaysCatID: "19667", WPCatID: 379, PriceCoeff: 1.30, TitlePrefix: "گلس و ", CoefficientType: "percent"},
+		{Name: "محافظ صفحه نمایش موبایل هوآوی", EwaysCatID: "3355", WPCatID: 381, PriceCoeff: 1.30, TitlePrefix: "گلس و ", CoefficientType: "percent"},
+
+		// 3. ساعت هوشمند
+		{Name: "ساعت هوشمند", EwaysCatID: "14548", WPCatID: 357, PriceCoeff: 1.12, TitlePrefix: ""},
+		{Name: "بند ساعت هوشمند", EwaysCatID: "9251", WPCatID: 385, PriceCoeff: 1.16, TitlePrefix: ""},
+
+		// 4. لوازم صوتی
+		{Name: "هدفون، هندزفری و هدست", EwaysCatID: "1593", WPCatID: 359, PriceCoeff: 1.10, TitlePrefix: ""},
+		{Name: "هدفون", EwaysCatID: "2550", WPCatID: 395, PriceCoeff: 1.06, TitlePrefix: ""},
+		{Name: "هندزفری باسیم", EwaysCatID: "2390", WPCatID: 397, PriceCoeff: 1.06, TitlePrefix: ""},
+		{Name: "هندزفری گردنی", EwaysCatID: "12898", WPCatID: 399, PriceCoeff: 1.06, TitlePrefix: ""},
+		{Name: "ایرفون و ایرپادز", EwaysCatID: "12896", WPCatID: 360, PriceCoeff: 1.08, TitlePrefix: ""},
+
+		// 5. پاوربانک
+		{Name: "پاوربانک ۱۰٬۰۰۰ میلی‌آمپر", EwaysCatID: "13091", WPCatID: 387, PriceCoeff: 1.30, TitlePrefix: ""},
+		{Name: "پاوربانک ۲۰٬۰۰۰ میلی‌آمپر", EwaysCatID: "13092", WPCatID: 389, PriceCoeff: 1.30, TitlePrefix: ""},
+		{Name: "پاوربانک ۳۰٬۰۰۰ میلی‌آمپر", EwaysCatID: "18058", WPCatID: 391, PriceCoeff: 1.30, TitlePrefix: ""},
+
+		// 6. لوازم جانبی موبایل (⚠️ این دو هنوز CatID تکراری دارند)
+		{Name: "آداپتور شارژر", EwaysCatID: "1585", WPCatID: 401, PriceCoeff: 1.16, TitlePrefix: ""},
+		{Name: "شارژر گوشی", EwaysCatID: "1585", WPCatID: 407, PriceCoeff: 1.16, TitlePrefix: ""},
+		{Name: "شارژر فندکی", EwaysCatID: "1609", WPCatID: 409, PriceCoeff: 1.20, TitlePrefix: ""},
+		{Name: "کابل شارژر", EwaysCatID: "1587", WPCatID: 403, PriceCoeff: 1.12, TitlePrefix: ""},
+		{Name: "محافظ کابل شارژر", EwaysCatID: "2675", WPCatID: 413, PriceCoeff: 1.15, TitlePrefix: ""},
+		{Name: "تبدیل ها", EwaysCatID: "2685", WPCatID: 415, PriceCoeff: 1.08, TitlePrefix: ""},
+		{Name: "هولدر و نگهدارنده موبایل", EwaysCatID: "2371", WPCatID: 411, PriceCoeff: 1.22, TitlePrefix: ""},
+
+		// 7. ذخیره‌سازی
+		{Name: "کارت حافظه و رم", EwaysCatID: "1396", WPCatID: 417, PriceCoeff: 1.20, TitlePrefix: "رم "},
+		{Name: "فلش مموری", EwaysCatID: "1395", WPCatID: 418, PriceCoeff: 1.10, TitlePrefix: "فلش "},
+		{Name: "هارد اکسترنال", EwaysCatID: "9426", WPCatID: 421, PriceCoeff: 1.20, TitlePrefix: ""},
+		{Name: "هارد SSD", EwaysCatID: "9752", WPCatID: 423, PriceCoeff: 1.05, TitlePrefix: ""},
+
+		// 8. تعمیرات موبایل
+		{Name: "تاچ ال سی و تعمیرات موبایل", EwaysCatID: "17496", WPCatID: 363, PriceCoeff: 1.07, TitlePrefix: "تاچ ال سی دی "},
+
+		// 9. کیف و کوله پشتی
+		{Name: "کیف و کوله پشتی", EwaysCatID: "20761", WPCatID: 364, PriceCoeff: 1.04, TitlePrefix: ""},
+	}
 }
 
 // ================================================================
@@ -269,6 +357,23 @@ func getEnvBool(key string, fallback bool) bool {
 		return v == "true" || v == "1" || v == "yes"
 	}
 	return fallback
+}
+
+func GetCategories() []Category {
+	return Categories
+}
+
+func GetFixedCost() float64 {
+	return FixedCost
+}
+
+func GetRoundTo() float64 {
+	return RoundTo
+}
+
+// ReloadSettings تنظیمات را از دیتابیس مجدداً بارگذاری می‌کند
+func ReloadSettings(databaseURL string) error {
+    return LoadFromDB(databaseURL)
 }
 
 // ================================================================

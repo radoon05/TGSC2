@@ -71,8 +71,9 @@ func main() {
 		c.JSON(200, gin.H{"status": "تنظیمات بارگذاری مجدد شد. (ری‌استارت ربات برای اعمال تغییرات)"})
 	})
 
-	log.Printf("🚀 پنل مدیریت روی http://localhost%s در حال اجراست...", port)
-	log.Fatal(r.Run(port))
+    addr := "0.0.0.0" + port
+    log.Printf("🚀 پنل مدیریت روی http://%s در حال اجراست...", addr)
+    log.Fatal(r.Run(addr))
 }
 
 func findIndexHTML() string {

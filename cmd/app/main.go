@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -158,6 +159,24 @@ func main() {
 			isScraping = false
 			scrapeMutex.Unlock()
 		}()
+
+		// ============================================================
+		// 🔥 بارگذاری مجدد تنظیمات از دیتابیس قبل از هر اسکرپ
+		// ============================================================
+		if err := config.ReloadSettings(cfg.Database.URL); err != nil {
+			log.Error("failed to reload settings from database", "error", err)
+			// ادامه با تنظیمات قدیمی (خطا را نادیده می‌گیریم)
+		} else {
+			// به‌روزرسانی Categories در اسکرپر کلاینت
+			newCategories := config.GetCategories()
+			scraperClient.UpdateCategories(newCategories)
+
+			// به‌روزرسانی FixedCost و RoundTo در Normalizer
+			normalizer.SetFixedCost(config.GetFixedCost())
+			normalizer.SetRoundTo(config.GetRoundTo())
+
+			log.Info("settings reloaded from database")
+		}
 
 		log.Info("scrape started")
 		products, err := scraperClient.FetchProducts(ctx)
@@ -313,51 +332,162 @@ func main() {
 	})
 
 	// Export products
-	mux.HandleFunc("GET /export-products", func(w http.ResponseWriter, r *http.Request) {
-		log := logger.New(cfg.LogLevel).Named("export")
-		log.Info("export products requested")
+	mux.HandleFunc("GET /backup-db", func(w http.ResponseWriter, r *http.Request) {
+		log := logger.New(cfg.LogLevel).Named("backup")
+		log.Info("database backup requested")
 
+		// تنظیم هدر برای دانلود فایل SQL
+		filename := fmt.Sprintf("backup_%s.sql", time.Now().Format("2006-01-02_15-04-05"))
+		w.Header().Set("Content-Type", "application/sql; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
+
+		// شروع نوشتن فایل SQL
+		fmt.Fprintf(w, "-- ============================================================\n")
+		fmt.Fprintf(w, "--  بکاپ کامل از دیتابیس scraper_sync\n")
+		fmt.Fprintf(w, "--  تاریخ: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(w, "-- ============================================================\n\n")
+
+		// ۱. گرفتن لیست همه جداول
 		rows, err := dbPool.Query(r.Context(), `
-			SELECT source_id, title, price, stock, fingerprint, last_scraped_at 
-			FROM products 
-			ORDER BY created_at DESC
-		`)
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+    `)
 		if err != nil {
+			log.Error("failed to get tables", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "خطا در خواندن دیتابیس: %v", err)
+			fmt.Fprintf(w, "خطا در خواندن جداول: %v", err)
 			return
 		}
 		defer rows.Close()
 
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Content-Disposition", "attachment; filename=products_export.txt")
-
-		fmt.Fprintf(w, "=== گزارش محصولات تاپ گارد ===\n")
-		fmt.Fprintf(w, "تاریخ: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-		fmt.Fprintf(w, "================================\n\n")
-		fmt.Fprintf(w, "%-10s | %-50s | %-12s | %-6s | %-20s\n", "SourceID", "عنوان", "قیمت (تومان)", "موجودی", "آخرین اسکرپ")
-		fmt.Fprintf(w, "-----------|----------------------------------------------------|--------------|--------|----------------------\n")
-
-		var count int
+		var tables []string
 		for rows.Next() {
-			var sourceID, title, fingerprint string
-			var price float64
-			var stock int
-			var lastScrapedAt time.Time
-			if err := rows.Scan(&sourceID, &title, &price, &stock, &fingerprint, &lastScrapedAt); err != nil {
+			var tableName string
+			if err := rows.Scan(&tableName); err != nil {
 				continue
 			}
-			count++
-			displayTitle := title
-			if len([]rune(title)) > 50 {
-				displayTitle = string([]rune(title)[:50]) + "..."
-			}
-			fmt.Fprintf(w, "%-10s | %-50s | %12.0f | %6d | %s\n",
-				sourceID, displayTitle, price, stock, lastScrapedAt.Format("2006-01-02 15:04"))
+			tables = append(tables, tableName)
 		}
-		fmt.Fprintf(w, "\n================================\n")
-		fmt.Fprintf(w, "تعداد کل محصولات: %d\n", count)
-		log.Info("export completed", "count", count)
+
+		log.Info("found tables", "count", len(tables))
+
+		// ۲. برای هر جدول، ساختار و داده‌ها را استخراج کن
+		for _, tableName := range tables {
+			// ۲.۱. دریافت ستون‌های جدول
+			colRows, err := dbPool.Query(r.Context(), `
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = $1
+            ORDER BY ordinal_position
+        `, tableName)
+			if err != nil {
+				log.Error("failed to get columns", "table", tableName, "error", err)
+				continue
+			}
+
+			var columns []string
+			var columnTypes []string
+			var nullable []string
+			for colRows.Next() {
+				var colName, dataType, isNullable string
+				if err := colRows.Scan(&colName, &dataType, &isNullable); err != nil {
+					continue
+				}
+				columns = append(columns, colName)
+				columnTypes = append(columnTypes, dataType)
+				nullable = append(nullable, isNullable)
+			}
+			colRows.Close()
+
+			if len(columns) == 0 {
+				continue
+			}
+
+			// ۲.۲. نوشتن دستور DELETE (برای پاک کردن داده‌های قبلی در صورت بازیابی)
+			fmt.Fprintf(w, "-- ============================================================\n")
+			fmt.Fprintf(w, "--  جدول: %s\n", tableName)
+			fmt.Fprintf(w, "-- ============================================================\n")
+			fmt.Fprintf(w, "DELETE FROM %s;\n\n", tableName)
+
+			// ۲.۳. ساخت کوئری SELECT
+			selectQuery := fmt.Sprintf("SELECT %s FROM %s", strings.Join(columns, ", "), tableName)
+			dataRows, err := dbPool.Query(r.Context(), selectQuery)
+			if err != nil {
+				log.Error("failed to query table", "table", tableName, "error", err)
+				continue
+			}
+
+			// ۲.۴. ساخت placeholder برای مقادیر
+			placeholders := make([]string, len(columns))
+			for i := range columns {
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+			}
+			insertTemplate := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);\n",
+				tableName,
+				strings.Join(columns, ", "),
+				strings.Join(placeholders, ", "),
+			)
+
+			// ۲.۵. خواندن و نوشتن داده‌ها (با استفاده از اسکن پویا)
+			var count int
+			for dataRows.Next() {
+				// ساخت slice از interface{} برای اسکن
+				values := make([]interface{}, len(columns))
+				valuePtrs := make([]interface{}, len(columns))
+				for i := range values {
+					valuePtrs[i] = &values[i]
+				}
+
+				if err := dataRows.Scan(valuePtrs...); err != nil {
+					log.Error("failed to scan row", "table", tableName, "error", err)
+					continue
+				}
+
+				// تبدیل مقادیر به رشته برای SQL
+				rowValues := make([]string, len(columns))
+				for i, v := range values {
+					if v == nil {
+						rowValues[i] = "NULL"
+					} else {
+						switch val := v.(type) {
+						case string:
+							// escape کردن single quote
+							rowValues[i] = fmt.Sprintf("'%s'", strings.ReplaceAll(val, "'", "''"))
+						case int64, int32, int:
+							rowValues[i] = fmt.Sprintf("%d", val)
+						case float64, float32:
+							rowValues[i] = fmt.Sprintf("%f", val)
+						case bool:
+							if val {
+								rowValues[i] = "true"
+							} else {
+								rowValues[i] = "false"
+							}
+						case time.Time:
+							rowValues[i] = fmt.Sprintf("'%s'", val.Format("2006-01-02 15:04:05.999999-07:00"))
+						case []byte:
+							// برای JSONB و bytea
+							rowValues[i] = fmt.Sprintf("'%s'", string(val))
+						default:
+							rowValues[i] = fmt.Sprintf("'%v'", val)
+						}
+					}
+				}
+
+				// نوشتن INSERT
+				fmt.Fprintf(w, insertTemplate, argsToInterface(rowValues)...)
+				count++
+			}
+			dataRows.Close()
+
+			fmt.Fprintf(w, "\n-- %d رکورد در جدول %s\n\n", count, tableName)
+			log.Info("table backed up", "table", tableName, "count", count)
+		}
+
+		log.Info("database backup completed")
 	})
 
 	// Test scrape
@@ -366,7 +496,7 @@ func main() {
 		log.Info("test scrape triggered - running in background")
 
 		testCategories := []config.Category{
-			{Name: "test cat", EwaysCatID: "18482", WPCatID: 38, PriceCoeff: 1.2},
+			{Name: "test cat", EwaysCatID: "18482", WPCatID: 3047, PriceCoeff: 1.2},
 		}
 		testScraper, err := scraper.NewClient(
 			&cfg.Scraper,
@@ -553,4 +683,13 @@ func runMigrations(databaseURL string) error {
 		log.Printf("Migration applied: %s", f)
 	}
 	return nil
+}
+
+// helper function: تبدیل []string به []interface{} برای استفاده در fmt.Sprintf
+func argsToInterface(args []string) []interface{} {
+	result := make([]interface{}, len(args))
+	for i, v := range args {
+		result[i] = v
+	}
+	return result
 }

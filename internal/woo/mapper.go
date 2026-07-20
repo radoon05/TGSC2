@@ -122,11 +122,64 @@ func MapToCreate(p *domain.Product) *WooProduct {
 //  MapToUpdate - برای آپدیت محصول (حداقلی: فقط قیمت و موجودی)
 // ============================================================
 func MapToUpdate(p *domain.Product) *WooProduct {
-	// فقط فیلدهای لازم برای آپدیت
-	return &WooProduct{
-		ID:            p.WooID,                      // شناسه ووکامرس (ضروری)
-		RegularPrice:  fmt.Sprintf("%.0f", p.Price), // قیمت نهایی
-		StockQuantity: p.Stock,                     // موجودی
-		// بقیه فیلدها ارسال نمی‌شوند تا از بازنویسی غیرضروری جلوگیری شود
-	}
+    wp := &WooProduct{
+        ID:            p.WooID,
+        RegularPrice:  fmt.Sprintf("%.0f", p.Price),
+        StockQuantity: p.Stock,
+    }
+
+    // 🔥 ارسال دسته‌بندی (اگر موجود باشد)
+    if p.WPCatID > 0 {
+        wp.Categories = []WooCat{{ID: p.WPCatID}}
+    }
+
+    // 🔥 ارسال تصاویر (اگر در دیتابیس وجود داشته باشد)
+    if len(p.GalleryImages) > 0 {
+        images := make([]WooImage, 0, len(p.GalleryImages))
+        for _, url := range p.GalleryImages {
+            if url != "" {
+                images = append(images, WooImage{Src: url})
+            }
+        }
+        if len(images) > 0 {
+            wp.Images = images
+        }
+    } else if p.ImageURL != "" {
+        wp.Images = []WooImage{{Src: p.ImageURL}}
+    }
+
+    // 🔥 ارسال ویژگی‌ها (اگر در دیتابیس وجود داشته باشد)
+    if p.Attributes != "" && p.Attributes != "[]" {
+        var rawAttrs []struct {
+            Name  string `json:"Name"`
+            Value string `json:"Value"`
+        }
+        if err := json.Unmarshal([]byte(p.Attributes), &rawAttrs); err == nil && len(rawAttrs) > 0 {
+            wooAttrs := make([]WooAttr, 0, len(rawAttrs))
+            for _, a := range rawAttrs {
+                wooAttrs = append(wooAttrs, WooAttr{
+                    Name:      a.Name,
+                    Options:   []string{a.Value},
+                    Visible:   true,
+                    Variation: false,
+                })
+            }
+            wp.Attributes = wooAttrs
+        }
+    }
+
+    return wp
 }
+
+
+
+// func MapToUpdate(p *domain.Product) *WooProduct {
+// 	// فقط فیلدهای لازم برای آپدیت
+// 	return &WooProduct{
+// 		ID:            p.WooID,                      // شناسه ووکامرس (ضروری)
+// 		RegularPrice:  fmt.Sprintf("%.0f", p.Price), // قیمت نهایی
+// 		StockQuantity: p.Stock,                     // موجودی
+		
+// 		// بقیه فیلدها ارسال نمی‌شوند تا از بازنویسی غیرضروری جلوگیری شود
+// 	}
+// }
